@@ -209,6 +209,7 @@ window.TROVE_CONFIG = {
     items: window.TroveData.SEED.map((s) => ({ ...s, history: [{ t: Date.now(), buy: s.buy, sell: s.sell }] })),
     watch: {},          // itemId -> { target, by }
     flips: [],          // { id, itemId, name, buy, sell, ship, venue, cond, when, by }
+    messages: [],       // { id, by, text, itemId, t } — private to the household
     settings: { fees: true, minMargin: 10, venue: 'ebay', sort: 'margin' },
     updatedAt: Date.now(),
   });
@@ -389,6 +390,9 @@ window.TROVE_CONFIG = {
     refresh: '<path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 21v-5h5"/>',
     x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
     check: '<path d="M20 6 9 17l-5-5"/>',
+    chat: '<path d="M8 12h8"/><path d="M8 8h5"/><path d="M21 15a2 2 0 0 1-2 2H8l-4 4V5a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2z"/>',
+    send: '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>',
+    clip: '<path d="m21 8-9.5 9.5a4 4 0 0 1-5.7-5.7L14 4a2.7 2.7 0 0 1 3.8 3.8L9.4 16.2a1.3 1.3 0 0 1-1.9-1.9L15 7"/>',
   };
   const svg = (d, size = 21, stroke = 'currentColor', fill = 'none') =>
     `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="${fill}" stroke="${stroke}" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round">${d}</svg>`;
@@ -400,6 +404,13 @@ window.TROVE_CONFIG = {
 
   const src = (key) => D.SOURCES.find((s) => s.key === key);
   const feeRate = (venue) => CFG.FEES[venue] != null ? CFG.FEES[venue] : 0;
+
+  const ME_KEY = 'trove.me';
+  const meName = () => localStorage.getItem(ME_KEY) || 'Me';
+  const setMe = (n) => { localStorage.setItem(ME_KEY, n); render(); };
+  const SEEN_KEY = 'trove.seen';
+  const lastSeen = () => parseInt(localStorage.getItem(SEEN_KEY) || '0', 10);
+  const markSeen = () => localStorage.setItem(SEEN_KEY, String(Date.now()));
 
   let ui = { tab: 'trending', filter: 'all', detail: null, sheet: null, query: '', toast: null, busy: false };
   const setUI = (patch) => { Object.assign(ui, patch); render(); };
@@ -579,6 +590,78 @@ window.TROVE_CONFIG = {
       </div></div>`;
   }
 
+  function chatScreen() {
+    const s = st();
+    const msgs = s.messages || [];
+    const attached = ui.attachItem && s.items.find((i) => i.id === ui.attachItem);
+    return `<div class="screen" style="display:flex;flex-direction:column;min-height:calc(100vh - 190px)">
+      <div style="display:flex;align-items:baseline;margin:8px 0 12px">
+        <h4 style="margin:0">${esc(s.householdName)}</h4>
+        <span class="muted" style="font-size:11px;margin-left:auto">${S.signedIn ? 'Private to your household' : 'On this phone until sync is on'}</span>
+      </div>
+
+      <div id="chatLog" style="flex:1;display:flex;flex-direction:column;gap:10px;padding-bottom:12px">
+        ${msgs.length ? msgs.map(bubble).join('')
+        : `<div style="text-align:center;padding:36px 20px;border:1px dashed var(--n-400);border-radius:28px">
+             <div style="font-family:var(--font-h);font-size:17px">No messages yet</div>
+             <p class="muted" style="font-size:12px;margin:6px 0 0">Send a deal to each other — tap the clip to attach anything you're tracking.</p>
+           </div>`}
+      </div>
+
+      ${attached ? `<div style="display:flex;align-items:center;gap:10px;background:var(--accent-100);border-radius:20px;padding:8px 12px;margin-bottom:8px">
+        ${avatar(attached, 28)}
+        <div class="ellip" style="flex:1;font-size:12px;font-weight:600">${esc(attached.name)}</div>
+        <button class="icon-btn" data-unattach="1" aria-label="Remove attachment" style="width:30px;height:30px;background:transparent">${svg(ICON.x, 14)}</button>
+      </div>` : ''}
+
+      <div style="position:sticky;bottom:0;display:flex;gap:8px;align-items:center;padding:8px 0 10px;background:var(--bg)">
+        <button class="icon-btn" data-sheet="attach" aria-label="Attach an item">${svg(ICON.clip, 18)}</button>
+        <input class="in" id="msgBox" placeholder="Message ${esc(otherName())}" style="flex:1" autocomplete="off">
+        <button class="icon-btn" data-send="1" aria-label="Send" style="background:var(--accent);color:var(--bg)">${svg(ICON.send, 18)}</button>
+      </div>
+    </div>`;
+  }
+
+  function otherName() {
+    const names = (st().members || []).map((m) => m.name).filter((n) => n !== meName());
+    return names[0] || 'your household';
+  }
+
+  function bubble(m) {
+    const mine = m.by === meName();
+    const item = m.itemId && st().items.find((i) => i.id === m.itemId);
+    const when = new Date(m.t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    return `<div style="display:flex;flex-direction:column;align-items:${mine ? 'flex-end' : 'flex-start'};gap:4px">
+      ${mine ? '' : `<div class="muted" style="font-size:10px;padding-left:12px">${esc(m.by)}</div>`}
+      <div style="max-width:86%;background:${mine ? 'var(--accent)' : 'var(--surface)'};color:${mine ? 'var(--bg)' : 'var(--text)'};
+        border-radius:22px;border-${mine ? 'bottom-right' : 'bottom-left'}-radius:8px;padding:10px 14px;font-size:13.5px;line-height:1.45">
+        ${m.text ? esc(m.text).replace(/\n/g, '<br>') : ''}
+        ${item ? `<a href="${buyUrl(item)}" target="_blank" rel="noopener" style="display:flex;align-items:center;gap:10px;margin-top:${m.text ? '10px' : '0'};
+            background:${mine ? 'rgba(255,255,255,.16)' : 'var(--bg)'};border-radius:18px;padding:9px 11px;text-decoration:none;color:inherit">
+            ${avatar(item, 34)}
+            <div style="flex:1;min-width:0">
+              <div class="ellip" style="font-size:12px;font-weight:700">${esc(item.name)}</div>
+              <div style="font-size:10.5px;opacity:.8">${money(item.buy)} → ${money(item.sell)} · ${money(netOf(item).net)} net</div>
+            </div>
+            ${svg(ICON.out, 12)}
+          </a>` : ''}
+      </div>
+      <div class="muted" style="font-size:9.5px;padding:0 12px">${when}</div>
+    </div>`;
+  }
+
+  function attachSheet() {
+    return sheet(`<h4 style="margin:0 0 4px">Send a deal</h4>
+      <p class="muted" style="font-size:12.5px">Pick something you're tracking — it arrives as a tappable card.</p>
+      <div style="display:flex;flex-direction:column;gap:8px;margin-top:12px">
+        ${st().items.slice(0, 40).map((i) => `<button class="row" data-pickattach="${i.id}">
+          ${avatar(i, 36)}
+          <div style="flex:1;min-width:0"><div class="ellip" style="font-size:12.5px;font-weight:600">${esc(i.name)}</div>
+          <div class="muted" style="font-size:10px">${money(i.buy)} → ${money(i.sell)}</div></div>
+        </button>`).join('')}
+      </div>`, [`<button class="btn btn-secondary" data-close="1" style="flex:1">Cancel</button>`]);
+  }
+
   function ledgerScreen() {
     const s = st();
     const rows = s.flips.map((f) => {
@@ -636,6 +719,12 @@ window.TROVE_CONFIG = {
         ? `<button class="btn btn-secondary btn-block" data-signout="1">Sign out</button>`
         : `<button class="btn btn-primary btn-block" data-sheet="signin">${CFG.SUPABASE_URL ? 'Sign in to sync' : 'Set up sync'}</button>`}
         </div>
+      </div>
+
+      <div class="card" style="margin-top:12px">
+        <label class="f">Your name in this household</label>
+        <input class="in" id="meName" value="${esc(meName())}" placeholder="Riley">
+        <div class="muted" style="font-size:10.5px;margin-top:6px">Shown on your chat messages and the flips you log.</div>
       </div>
 
       <h4 style="margin:24px 0 10px">Selling assumptions</h4>
@@ -813,9 +902,11 @@ window.TROVE_CONFIG = {
       <button class="icon-btn" data-searchtoggle="1" aria-label="Search">${svg(ICON.search, 19)}</button>
       <button class="icon-btn" data-sheet="add" aria-label="Add item">${svg(ICON.plus, 19)}</button>`;
 
-    const tabs = [['trending', 'Trending', ICON.trend], ['watch', 'Watch', ICON.mark], ['ledger', 'Ledger', ICON.book], ['you', 'You', ICON.user]];
+    const unread = (s.messages || []).some((m) => m.by !== meName() && m.t > lastSeen());
+    const tabs = [['trending', 'Trending', ICON.trend], ['watch', 'Watch', ICON.mark], ['chat', 'Chat', ICON.chat], ['ledger', 'Ledger', ICON.book], ['you', 'You', ICON.user]];
     $('tabs').innerHTML = tabs.map(([k, l, i]) =>
-      `<button data-tab="${k}" ${ui.tab === k ? 'aria-current="page"' : ''}>${svg(i)}<span>${l}</span></button>`).join('');
+      `<button data-tab="${k}" ${ui.tab === k ? 'aria-current="page"' : ''} style="position:relative">${svg(i)}${k === 'chat' && unread && ui.tab !== 'chat'
+        ? '<span style="position:absolute;top:4px;right:calc(50% - 16px);width:9px;height:9px;border-radius:50%;background:var(--accent)"></span>' : ''}<span>${l}</span></button>`).join('');
 
     const searchBar = ui.searching
       ? `<input class="in" id="searchBox" placeholder="Search tracked items" value="${esc(ui.query)}" style="margin:6px 0 4px">` : '';
@@ -823,17 +914,20 @@ window.TROVE_CONFIG = {
     $('main').innerHTML = searchBar + (
       ui.tab === 'trending' ? trendingScreen()
         : ui.tab === 'watch' ? watchScreen()
-          : ui.tab === 'ledger' ? ledgerScreen() : youScreen());
+          : ui.tab === 'chat' ? chatScreen()
+            : ui.tab === 'ledger' ? ledgerScreen() : youScreen());
 
     const item = ui.detail && s.items.find((i) => i.id === ui.detail);
     $('overlay').innerHTML =
       (item ? detailSheet(item)
         : ui.sheet === 'add' ? addSheet()
           : ui.sheet === 'flip' ? flipSheet(ui.flipItem)
-            : ui.sheet === 'signin' ? signinSheet() : '')
+            : ui.sheet === 'signin' ? signinSheet()
+              : ui.sheet === 'attach' ? attachSheet() : '')
       + (ui.toast ? `<div class="toast">${esc(ui.toast)}</div>` : '');
 
     if (ui.searching) { const b = $('searchBox'); if (b) b.focus(); }
+    if (ui.tab === 'chat' && ui.draft) { const b = $('msgBox'); if (b) b.value = ui.draft; }
     wireSheet();
   }
 
@@ -845,17 +939,38 @@ window.TROVE_CONFIG = {
 
   // ---------------- events ----------------
   document.addEventListener('click', async (e) => {
-    const t = e.target.closest('[data-tab],[data-sort],[data-filter],[data-open],[data-sheet],[data-backdrop],[data-close],[data-unwatch],[data-watch],[data-refresh],[data-delete],[data-clearphoto],[data-add],[data-saveflip],[data-fees],[data-venue],[data-kind],[data-cond],[data-export],[data-reset],[data-signout],[data-sendlink],[data-join],[data-share],[data-searchtoggle]');
+    const t = e.target.closest('[data-tab],[data-sort],[data-filter],[data-open],[data-sheet],[data-backdrop],[data-close],[data-unwatch],[data-watch],[data-refresh],[data-delete],[data-clearphoto],[data-add],[data-saveflip],[data-fees],[data-venue],[data-kind],[data-cond],[data-export],[data-reset],[data-signout],[data-sendlink],[data-join],[data-share],[data-searchtoggle],[data-send],[data-attach],[data-unattach],[data-pickattach]');
     if (!t) return;
     const d = t.dataset;
 
-    if (d.tab) return setUI({ tab: d.tab, detail: null, sheet: null, searching: false });
+    if (d.tab) {
+      setUI({ tab: d.tab, detail: null, sheet: null, searching: false });
+      if (d.tab === 'chat') { markSeen(); $('main').scrollTop = $('main').scrollHeight; }
+      return;
+    }
     if (d.sort) return S.update((s) => { s.settings.sort = d.sort; });
     if (d.filter) return setUI({ filter: d.filter });
     if (d.searchtoggle) return setUI({ searching: !ui.searching, query: '' });
     if (d.open) return setUI({ detail: d.open, sheet: null });
     if (d.sheet) return setUI({ sheet: d.sheet, flipItem: d.item || ui.detail, detail: null });
     if (d.close || (d.backdrop && e.target.classList.contains('sheet-back'))) return setUI({ sheet: null, detail: null });
+
+    if (d.send) {
+      const box = $('msgBox');
+      const text = (box && box.value || '').trim();
+      if (!text && !ui.attachItem) return;
+      S.update((s) => {
+        s.messages = (s.messages || []).concat([{ id: uid(), by: meName(), text, itemId: ui.attachItem || null, t: Date.now() }]).slice(-300);
+      });
+      ui.attachItem = null; ui.draft = '';
+      markSeen();
+      render();
+      const log = $('chatLog');
+      if (log) $('main').scrollTop = $('main').scrollHeight;
+      return;
+    }
+    if (d.pickattach) { ui.attachItem = d.pickattach; return setUI({ sheet: null, tab: 'chat' }); }
+    if (d.unattach) { ui.attachItem = null; return render(); }
 
     if (d.unwatch) return S.update((s) => { delete s.watch[d.unwatch]; });
     if (d.watch) {
@@ -960,6 +1075,7 @@ window.TROVE_CONFIG = {
       });
       return;
     }
+    if (e.target.id === 'meName') { setMe(e.target.value.trim() || 'Me'); return; }
     const p = e.target.dataset.price;
     if (p && ui.detail) {
       const val = parseFloat(e.target.value) || 0;
@@ -972,6 +1088,7 @@ window.TROVE_CONFIG = {
   });
 
   document.addEventListener('input', (e) => {
+    if (e.target.id === 'msgBox') { ui.draft = e.target.value; return; }
     if (e.target.id === 'searchBox') { ui.query = e.target.value; const m = $('main'); const scroll = m.scrollTop; render(); m.scrollTop = scroll; }
   });
 
@@ -1009,6 +1126,11 @@ window.TROVE_CONFIG = {
 
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && (ui.sheet || ui.detail)) setUI({ sheet: null, detail: null });
+    if (e.key === 'Enter' && e.target.id === 'msgBox') {
+      e.preventDefault();
+      const btn = document.querySelector('[data-send]');
+      if (btn) btn.click();
+    }
   });
 
   S.on(render);

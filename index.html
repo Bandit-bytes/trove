@@ -121,7 +121,7 @@ input.in,select.in{width:100%;min-height:44px;padding:8px 14px;background:var(--
 window.TROVE_CONFIG = {
   // --- Tier 1: cloud sync between phones (Supabase, free tier) ---
   SUPABASE_URL: 'https://mqmwakroingacbgbsfzw.supabase.co',       // e.g. 'https://abcdefgh.supabase.co'
-  SUPABASE_ANON_KEY: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1xbXdha3JvaW5nYWNiZ2JzZnp3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODUxMDkyNjAsImV4cCI6MjEwMDY4NTI2MH0.mti6NwxylL7oZ8Ch4i3NO6U0TS-MDpvktLG-f1IYPWg',  // the public "anon" key — safe in a public repo
+  SUPABASE_ANON_KEY: ''eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1xbXdha3JvaW5nYWNiZ2JzZnp3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODUxMDkyNjAsImV4cCI6MjEwMDY4NTI2MH0.mti6NwxylL7oZ8Ch4i3NO6U0TS-MDpvktLG-f1IYPWg',  // the public "anon" key — safe in a public repo
 
   // --- Tier 2: live prices (a Supabase Edge Function that talks to eBay) ---
   // Leave empty to keep entering prices by hand.
@@ -317,6 +317,15 @@ window.TROVE_CONFIG = {
       if (!supa) throw new Error('Cloud sync is not configured yet — see README.');
       const { error } = await supa.auth.signInWithOtp({ email, options: { emailRedirectTo: location.href } });
       if (error) throw error;
+    },
+    // 6-digit code sign-in: works entirely inside the installed app, so the
+// magic link never has to bounce through Safari.
+    async verifyCode(email, code) {
+      if (!supa) await initCloud();
+      if (!supa) throw new Error('Cloud sync is not configured yet — see README.');
+      const { error } = await supa.auth.verifyOtp({ email: email.trim(), token: code.trim(), type: 'email' });
+      if (error) throw error;
+      await attachHousehold();
     },
     async signOut() { if (supa) await supa.auth.signOut(); householdId = null; },
 
@@ -876,11 +885,21 @@ window.TROVE_CONFIG = {
         [`<button class="btn btn-primary" data-close="1" style="flex:1">Got it</button>`]);
     }
     return sheet(`<h4 style="margin:0 0 4px">Sign in</h4>
-      <p class="muted" style="font-size:12.5px">We email you a one-tap link — no password to remember.</p>
-      <div style="margin-top:12px"><label class="f">Email</label><input class="in" id="authEmail" inputmode="email" placeholder="you@example.com"></div>
-      <div style="margin-top:14px"><label class="f">Joining your partner? Enter their invite code</label>
-        <div style="display:flex;gap:9px"><input class="in" id="joinCode" placeholder="TROVE-0000" style="flex:1"><button class="btn btn-secondary" data-join="1">Join</button></div></div>`,
-      [`<button class="btn btn-primary" data-sendlink="1" style="flex:1">Email me a link</button>`]);
+      <p class="muted" style="font-size:12.5px">We email you a 6-digit code. Type it here — that way you stay inside the app instead of bouncing out to Safari.</p>
+      <div style="margin-top:12px"><label class="f">Email</label>
+        <input class="in" id="authEmail" inputmode="email" autocomplete="email" placeholder="you@example.com" value="${esc(ui.authEmail || '')}"></div>
+      <div style="margin-top:12px"><label class="f">Code from the email</label>
+        <div style="display:flex;gap:9px">
+          <input class="in" id="authCode" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" style="flex:1;letter-spacing:.18em;font-family:var(--font-h)">
+          <button class="btn btn-primary" data-verify="1">Verify</button>
+        </div>
+        <div class="muted" style="font-size:10.5px;margin-top:6px">The email also has a link — the code is the reliable one on a home-screen app.</div>
+      </div>
+      <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--divider)">
+        <label class="f">Already have a household? Enter its invite code</label>
+        <div style="display:flex;gap:9px"><input class="in" id="joinCode" placeholder="TROVE-0000" style="flex:1"><button class="btn btn-secondary" data-join="1">Join</button></div>
+      </div>`,
+      [`<button class="btn btn-secondary" data-sendlink="1" style="flex:1">Send me a code</button>`]);
   }
 
   function sheet(body, actions) {
@@ -939,7 +958,7 @@ window.TROVE_CONFIG = {
 
   // ---------------- events ----------------
   document.addEventListener('click', async (e) => {
-    const t = e.target.closest('[data-tab],[data-sort],[data-filter],[data-open],[data-sheet],[data-backdrop],[data-close],[data-unwatch],[data-watch],[data-refresh],[data-delete],[data-clearphoto],[data-add],[data-saveflip],[data-fees],[data-venue],[data-kind],[data-cond],[data-export],[data-reset],[data-signout],[data-sendlink],[data-join],[data-share],[data-searchtoggle],[data-send],[data-attach],[data-unattach],[data-pickattach]');
+    const t = e.target.closest('[data-tab],[data-sort],[data-filter],[data-open],[data-sheet],[data-backdrop],[data-close],[data-unwatch],[data-watch],[data-refresh],[data-delete],[data-clearphoto],[data-add],[data-saveflip],[data-fees],[data-venue],[data-kind],[data-cond],[data-export],[data-reset],[data-signout],[data-sendlink],[data-join],[data-share],[data-searchtoggle],[data-send],[data-attach],[data-unattach],[data-pickattach],[data-verify]');
     if (!t) return;
     const d = t.dataset;
 
@@ -1036,7 +1055,16 @@ window.TROVE_CONFIG = {
     if (d.sendlink) {
       const email = ($('authEmail').value || '').trim();
       if (!email) return toast('Enter your email');
-      try { await S.signIn(email); toast('Check your email for the link'); }
+      ui.authEmail = email;
+      try { await S.signIn(email); toast('Code sent — check your email'); }
+      catch (err) { toast(err.message); }
+      return;
+    }
+    if (d.verify) {
+      const email = ($('authEmail').value || ui.authEmail || '').trim();
+      const code = ($('authCode').value || '').trim();
+      if (!email || !code) return toast('Enter your email and the code');
+      try { await S.verifyCode(email, code); toast('Signed in'); setUI({ sheet: null }); }
       catch (err) { toast(err.message); }
       return;
     }

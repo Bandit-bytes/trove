@@ -121,7 +121,7 @@ input.in,select.in{width:100%;min-height:44px;padding:8px 14px;background:var(--
 window.TROVE_CONFIG = {
   // --- Tier 1: cloud sync between phones (Supabase, free tier) ---
   SUPABASE_URL: 'https://mqmwakroingacbgbsfzw.supabase.co',       // e.g. 'https://abcdefgh.supabase.co'
-  SUPABASE_ANON_KEY: ''eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1xbXdha3JvaW5nYWNiZ2JzZnp3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODUxMDkyNjAsImV4cCI6MjEwMDY4NTI2MH0.mti6NwxylL7oZ8Ch4i3NO6U0TS-MDpvktLG-f1IYPWg',  // the public "anon" key — safe in a public repo
+  SUPABASE_ANON_KEY: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1xbXdha3JvaW5nYWNiZ2JzZnp3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODUxMDkyNjAsImV4cCI6MjEwMDY4NTI2MH0.mti6NwxylL7oZ8Ch4i3NO6U0TS-MDpvktLG-f1IYPWg',  // the public "anon" key — safe in a public repo
 
   // --- Tier 2: live prices (a Supabase Edge Function that talks to eBay) ---
   // Leave empty to keep entering prices by hand.
@@ -214,7 +214,26 @@ window.TROVE_CONFIG = {
     updatedAt: Date.now(),
   });
 
-  let state = load();
+  // Anything that arrives from storage or the cloud gets backfilled, so a
+  // document written by an older build can never blank the screen.
+  function normalize(x) {
+    const base = freshState();
+    const out = Object.assign({}, base, x || {});
+    if (!Array.isArray(out.items) || !out.items.length) out.items = base.items;
+    out.items = out.items.filter(Boolean).map((i) => Object.assign({
+      id: 'i' + Math.random().toString(36).slice(2, 8), name: 'Untitled', kind: 'handheld',
+      cond: 'used', buy: 0, sell: 0, history: [],
+    }, i));
+    if (!Array.isArray(out.flips)) out.flips = [];
+    if (!Array.isArray(out.messages)) out.messages = [];
+    if (!Array.isArray(out.members) || !out.members.length) out.members = base.members;
+    if (!out.watch || typeof out.watch !== 'object') out.watch = {};
+    out.settings = Object.assign({}, base.settings, out.settings || {});
+    if (!out.updatedAt) out.updatedAt = Date.now();
+    return out;
+  }
+
+  let state = normalize(load());
   let supa = null;
   let householdId = null;
   let channel = null;
@@ -270,7 +289,7 @@ window.TROVE_CONFIG = {
   async function pullRemote() {
     const { data } = await supa.from('households').select('data, code, name').eq('id', householdId).single();
     if (data && data.data && data.data.updatedAt > (state.updatedAt || 0)) {
-      state = { ...data.data, inviteCode: data.code, householdName: data.name };
+      state = normalize({ ...data.data, inviteCode: data.code, householdName: data.name });
       try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
       emit();
     } else if (data) {
@@ -295,7 +314,7 @@ window.TROVE_CONFIG = {
         (payload) => {
           const remote = payload.new && payload.new.data;
           if (remote && remote.updatedAt > state.updatedAt) {
-            state = remote;
+            state = normalize(remote);
             try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
             emit();
           }
@@ -311,6 +330,7 @@ window.TROVE_CONFIG = {
     on(fn) { listeners.add(fn); return () => listeners.delete(fn); },
     update(mutator) { mutator(state); persist(); },
     reset() { state = freshState(); persist(); },
+    repair() { state = normalize(state); persist(); },
 
     async signIn(email) {
       if (!supa) await initCloud();
@@ -915,6 +935,19 @@ window.TROVE_CONFIG = {
 
   // ---------------- render ----------------
   function render() {
+    try { paint(); }
+    catch (err) {
+      console.error(err);
+      $('main').innerHTML = `<div class="card" style="margin-top:14px">
+        <div style="font-family:var(--font-h);font-size:17px">Something in your data tripped this screen</div>
+        <p class="muted" style="font-size:12px;margin:8px 0 0">${esc(err.message || String(err))}</p>
+        <button class="btn btn-primary" data-repair="1" style="margin-top:12px">Repair my data</button>
+        <button class="btn btn-secondary" data-reset="1" style="margin-top:8px">Start fresh on this phone</button>
+      </div>`;
+    }
+  }
+
+  function paint() {
     const s = st();
     $('top').innerHTML = `
       <div style="margin-right:auto"><div class="brand">Trove</div><div class="kicker">Buy low · sell high</div></div>
@@ -958,7 +991,7 @@ window.TROVE_CONFIG = {
 
   // ---------------- events ----------------
   document.addEventListener('click', async (e) => {
-    const t = e.target.closest('[data-tab],[data-sort],[data-filter],[data-open],[data-sheet],[data-backdrop],[data-close],[data-unwatch],[data-watch],[data-refresh],[data-delete],[data-clearphoto],[data-add],[data-saveflip],[data-fees],[data-venue],[data-kind],[data-cond],[data-export],[data-reset],[data-signout],[data-sendlink],[data-join],[data-share],[data-searchtoggle],[data-send],[data-attach],[data-unattach],[data-pickattach],[data-verify]');
+    const t = e.target.closest('[data-tab],[data-sort],[data-filter],[data-open],[data-sheet],[data-backdrop],[data-close],[data-unwatch],[data-watch],[data-refresh],[data-delete],[data-clearphoto],[data-add],[data-saveflip],[data-fees],[data-venue],[data-kind],[data-cond],[data-export],[data-reset],[data-signout],[data-sendlink],[data-join],[data-share],[data-searchtoggle],[data-send],[data-attach],[data-unattach],[data-pickattach],[data-verify],[data-repair]');
     if (!t) return;
     const d = t.dataset;
 
@@ -1048,6 +1081,7 @@ window.TROVE_CONFIG = {
       a.href = URL.createObjectURL(blob); a.download = 'trove-backup.json'; a.click();
       return;
     }
+    if (d.repair) { S.repair(); return toast('Data repaired'); }
     if (d.reset) { if (confirm('Reset Trove on this phone? Cloud data is kept.')) S.reset(); return; }
     if (d.signout) { await S.signOut(); return toast('Signed out'); }
     if (d.share && navigator.share) { navigator.share({ title: 'Join my Trove household', text: 'Invite code: ' + st().inviteCode }); return; }

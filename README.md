@@ -31,25 +31,57 @@ serves from HTTPS — required for the offline service worker to register.
 - **Trending** ranks everything you track by net profit. Sort by dollars, percentage, or cheapest.
 - **+** in the header adds anything — type it the way you'd search eBay, because that text drives every buy link.
 - Tapping an item opens the detail sheet: edit buy/sold prices, see the history curve, open Best Buy / Walmart / Amazon / GameStop / eBay / Mercari / FB Marketplace / OfferUp, jump to sold comps and PriceCharting, and set a target price.
+- **Photos:** open an item and tap **Add a photo** to use a picture from your camera roll instead of initials. With live prices on, the listing photo fills in automatically.
 - **Watch** shows how far each target still has to fall.
 - **Ledger** records real flips with fees and shipping subtracted, and totals your actual profit.
 - **You** holds fee assumptions, default venue, JSON export, and sync setup.
 
 ---
 
-## Tier 1 — sync between two phones
+## Tier 1 — accounts + sync between two phones
 
-1. Create a free project at [supabase.com](https://supabase.com).
-2. SQL Editor → paste `supabase/schema.sql` → **Run**.
-3. Authentication → Providers → **Email** → enable magic links.
-4. Project Settings → API → copy the **Project URL** and the **anon public key**.
-5. Edit `config.js`, paste both in, commit. (The anon key is designed to be public — row-level
-   security in the schema is what protects the data.)
-6. On your phone: You → **Sign in to sync** → enter your email → tap the link it sends.
-7. Your household gets an invite code. Your wife signs in on her phone, enters that code, and
-   both phones now read and write the same watchlist, items and ledger — live.
+You need one free Supabase project. Nothing to install, no card.
 
----
+**1. Make the project**
+- Go to supabase.com → Sign in with GitHub → **New project**.
+- Name: `trove`. Set a database password (save it somewhere; you won't need it day to day).
+- Region: closest to you. Click **Create new project** and wait ~2 minutes.
+
+**2. Create the tables**
+- Left sidebar → **SQL Editor** → **New query**.
+- Open `supabase/schema.sql` from this repo, copy everything, paste it in.
+- Click **Run**. You should see "Success. No rows returned".
+
+**3. Turn on email sign-in**
+- Left sidebar → **Authentication** → **Sign In / Providers**.
+- Make sure **Email** is enabled. Turn ON "Enable email OTP / magic link".
+- Optional but recommended: **Authentication → URL Configuration** → set Site URL to
+  `https://<your-username>.github.io/trove/` so the magic link returns to the app.
+
+**4. Copy your keys**
+- Left sidebar → **Project Settings** (gear) → **API**.
+- Copy **Project URL** and the **anon public** key.
+
+**5. Paste them into the app**
+- In the repo, open `config.js` → pencil icon → fill in:
+  ```js
+  SUPABASE_URL: 'https://xxxxxxxx.supabase.co',
+  SUPABASE_ANON_KEY: 'eyJhbGciOi...',
+  ```
+- **Commit changes**. Wait a minute for Pages to redeploy.
+
+The anon key is meant to be public — the row-level security in `schema.sql` is what protects data.
+
+**6. Sign in on your phone**
+- Open the app → **You** tab → **Sign in to sync** → type your email → **Email me a link**.
+- Open the email on the phone, tap the link — it comes back to Trove signed in.
+- Your household is created automatically and shows an **invite code**.
+
+**7. Add your wife**
+- Send her the same Pages URL; she adds it to her home screen.
+- She taps **You → Sign in to sync**, enters her own email, taps her link.
+- Then she types your invite code into "Joining your partner?" and taps **Join**.
+- From then on both phones read and write the same items, watchlist and ledger — live.
 
 ## Tier 2 — live prices
 
@@ -66,7 +98,8 @@ serves from HTTPS — required for the offline service worker to register.
 3. Put the function URL in `config.js` as `PRICES_ENDPOINT`
    (`https://<ref>.supabase.co/functions/v1/prices`), commit.
 4. In the app, the refresh icon on any item now pulls live eBay listings, updates the buy price,
-   and records a point on the history curve.
+   grabs the listing photo, and records a point on the history curve. The Buy button then links
+   straight to **that exact listing** — the one the price came from — instead of a search page.
 
 **Honest caveat:** eBay's Browse API gives *live asking prices*. Real **sold** comps come from the
 Marketplace Insights API, which eBay grants on application. Until you're approved, the function

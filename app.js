@@ -78,10 +78,19 @@
     </svg>`;
   }
 
-  function avatar(name, size, id) {
-    const [bg, fg] = tintOf(id || name);
+  function avatar(subject, size, id) {
+    const item = subject && typeof subject === 'object' ? subject : null;
+    const name = item ? item.name : subject;
+    if (item && item.image) {
+      return `<img src="${esc(item.image)}" alt="" loading="lazy" style="width:${size}px;height:${size}px;border-radius:${Math.round(size * 0.3)}px;object-fit:cover;background:var(--n-200);flex:none">`;
+    }
+    const [bg, fg] = tintOf(id || (item && item.id) || name);
     return `<div class="mono" style="width:${size}px;height:${size}px;background:${bg};color:${fg};font-size:${Math.round(size * 0.32)}px">${esc(monoOf(name))}</div>`;
   }
+
+  // The exact listing behind the number, when we have one; otherwise the search.
+  const buyUrl = (it) => it.bestUrl || src('ebay').url(it.name);
+  const buyLabel = (it) => (it.bestUrl ? 'Buy — ' + money(it.bestPrice || it.buy) : 'Buy — see listings');
 
   // ---------------- screens ----------------
   function trendingScreen() {
@@ -125,7 +134,7 @@
       <div style="position:absolute;right:-46px;top:-46px;width:150px;height:150px;border-radius:50%;background:rgba(255,255,255,.06)"></div>
       <div style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent-300)">Best spread right now</div>
       <div style="display:flex;align-items:center;gap:13px;margin-top:12px">
-        ${avatar(it.name, 52, it.id)}
+        ${avatar(it, 52)}
         <div style="min-width:0"><div style="font-family:var(--font-h);font-size:20px;line-height:1.15">${esc(it.name)}</div>
         <div style="font-size:11px;color:var(--accent-300);margin-top:3px">${money(it.buy)} → ${money(it.sell)} · ${esc(it.cond)}</div></div>
       </div>
@@ -135,7 +144,7 @@
         <div style="margin-left:auto;text-align:right;font-size:12px;color:var(--accent-300)">${it.pct.toFixed(0)}% return</div>
       </div>
       <div style="display:flex;gap:9px;margin-top:16px">
-        <a class="btn" href="${src('ebay').url(it.name)}" target="_blank" rel="noopener" style="flex:1;background:var(--accent-300);color:var(--accent-900)">Buy now</a>
+        <a class="btn" href="${buyUrl(it)}" target="_blank" rel="noopener" style="flex:1;background:var(--accent-300);color:var(--accent-900)">${it.bestUrl ? 'Buy ' + money(it.bestPrice || it.buy) : 'Buy now'}</a>
         <button class="btn" data-open="${it.id}" style="background:rgba(255,255,255,.14);color:var(--accent-100)">Details</button>
       </div>
     </div>`;
@@ -145,7 +154,7 @@
     const good = it.net >= 0;
     const watched = !!st().watch[it.id];
     return `<button class="row" data-open="${it.id}">
-      ${avatar(it.name, 42, it.id)}
+      ${avatar(it, 42)}
       <div style="flex:1;min-width:0">
         <div class="ellip" style="font-size:13.5px;font-weight:600">${esc(it.name)}${watched ? ' ★' : ''}</div>
         <div class="ellip muted" style="font-size:10.5px">${money(it.buy)} → ${money(it.sell)} · ${esc(it.cond)}${it.refreshedAt ? ' · updated ' + ago(it.refreshedAt) : ''}</div>
@@ -184,7 +193,7 @@
       const pct = Math.max(6, Math.min(100, (w.target / it.buy) * 100));
       return `<div class="card" style="padding:14px 15px">
           <div style="display:flex;align-items:center;gap:11px">
-            ${avatar(it.name, 40, it.id)}
+            ${avatar(it, 40)}
             <div style="flex:1;min-width:0">
               <div class="ellip" style="font-size:13.5px;font-weight:600">${esc(it.name)}</div>
               <div class="muted" style="font-size:10.5px">Alert under ${money(w.target)} · sells for ${money(it.sell)}</div>
@@ -193,7 +202,7 @@
           </div>
           <div style="margin-top:12px"><div class="bar"><i style="width:${pct}%;background:${hit ? 'var(--sage-600)' : 'var(--accent-600)'}"></i></div>
           <div style="display:flex;justify-content:space-between;margin-top:7px;font-size:10.5px">
-            <a href="${src('ebay').url(it.name)}" target="_blank" rel="noopener">Now ${money(it.buy)} — open listings</a>
+            <a href="${buyUrl(it)}" target="_blank" rel="noopener">Now ${money(it.buy)} — ${it.bestUrl ? 'open this listing' : 'open listings'}</a>
             <span style="font-weight:700;color:${hit ? 'var(--sage-700)' : 'var(--accent-700)'}">${hit ? 'Target hit' : money(it.buy - w.target) + ' to go'}</span>
           </div></div>
         </div>`;
@@ -294,10 +303,15 @@
     const listings = item.listings || [];
     return sheet(`
       <div style="display:flex;align-items:center;gap:12px">
-        ${avatar(item.name, 50, item.id)}
+        ${avatar(item, 50)}
         <div style="flex:1;min-width:0"><div style="font-family:var(--font-h);font-size:20px;line-height:1.15">${esc(item.name)}</div>
         <div class="muted" style="font-size:11px;margin-top:2px">${esc(item.cond)}${item.refreshedAt ? ' · updated ' + ago(item.refreshedAt) : ' · price entered by hand'}</div></div>
         <button class="icon-btn" data-refresh="${item.id}" aria-label="Refresh price">${svg(ICON.refresh, 18)}</button>
+      </div>
+
+      <div style="display:flex;gap:9px;margin-top:12px">
+        <label class="btn btn-secondary" style="flex:1;cursor:pointer">${item.image ? 'Replace photo' : 'Add a photo'}<input type="file" accept="image/*" data-photo="${item.id}" style="display:none"></label>
+        ${item.image ? `<button class="btn btn-ghost" data-clearphoto="${item.id}">Remove</button>` : ''}
       </div>
 
       <div style="display:flex;gap:11px;margin-top:16px">
@@ -347,7 +361,7 @@
         </div>
       </div>
     `, [
-      `<a class="btn btn-primary" href="${src('ebay').url(item.name)}" target="_blank" rel="noopener" style="flex:1">Buy — see listings</a>`,
+      `<a class="btn btn-primary" href="${buyUrl(item)}" target="_blank" rel="noopener" style="flex:1">${buyLabel(item)}</a>`,
       `<button class="btn btn-secondary" data-sheet="flip" data-item="${item.id}">Log flip</button>`,
     ]);
   }
@@ -413,7 +427,10 @@
 
   function sheet(body, actions) {
     return `<div class="sheet-back" data-backdrop="1"><div class="sheet">
-      <div class="grab"></div>
+      <div style="position:relative;flex:none">
+        <div class="grab"></div>
+        <button class="icon-btn" data-close="1" aria-label="Close" style="position:absolute;right:14px;top:4px;width:36px;height:36px">${svg(ICON.x, 17)}</button>
+      </div>
       <div class="sheet-body">${body}<div style="height:14px"></div></div>
       <div class="sheet-foot">${actions.join('')}</div>
     </div></div>`;
@@ -448,6 +465,7 @@
       + (ui.toast ? `<div class="toast">${esc(ui.toast)}</div>` : '');
 
     if (ui.searching) { const b = $('searchBox'); if (b) b.focus(); }
+    wireSheet();
   }
 
   function toast(msg) {
@@ -458,7 +476,7 @@
 
   // ---------------- events ----------------
   document.addEventListener('click', async (e) => {
-    const t = e.target.closest('[data-tab],[data-sort],[data-filter],[data-open],[data-sheet],[data-backdrop],[data-close],[data-unwatch],[data-watch],[data-refresh],[data-delete],[data-add],[data-saveflip],[data-fees],[data-venue],[data-kind],[data-cond],[data-export],[data-reset],[data-signout],[data-sendlink],[data-join],[data-share],[data-searchtoggle]');
+    const t = e.target.closest('[data-tab],[data-sort],[data-filter],[data-open],[data-sheet],[data-backdrop],[data-close],[data-unwatch],[data-watch],[data-refresh],[data-delete],[data-clearphoto],[data-add],[data-saveflip],[data-fees],[data-venue],[data-kind],[data-cond],[data-export],[data-reset],[data-signout],[data-sendlink],[data-join],[data-share],[data-searchtoggle]');
     if (!t) return;
     const d = t.dataset;
 
@@ -483,6 +501,7 @@
       catch (err) { toast(err.message); }
       return;
     }
+    if (d.clearphoto) { S.update((s) => { const it = s.items.find((i) => i.id === d.clearphoto); if (it) delete it.image; }); return; }
     if (d.delete) { S.update((s) => { s.items = s.items.filter((i) => i.id !== d.delete); delete s.watch[d.delete]; }); return setUI({ detail: null }); }
 
     if (d.kind || d.cond) { t.parentElement.querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', b === t)); return; }
@@ -545,7 +564,33 @@
     }
   });
 
+  function readPhoto(file, cb) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const max = 420;
+        const scale = Math.min(1, max / Math.max(img.width, img.height));
+        const c = document.createElement('canvas');
+        c.width = Math.round(img.width * scale);
+        c.height = Math.round(img.height * scale);
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+        cb(c.toDataURL('image/jpeg', 0.82));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  }
+
   document.addEventListener('change', (e) => {
+    const photoId = e.target.dataset.photo;
+    if (photoId && e.target.files && e.target.files[0]) {
+      readPhoto(e.target.files[0], (dataUrl) => {
+        S.update((s) => { const it = s.items.find((i) => i.id === photoId); if (it) it.image = dataUrl; });
+        toast('Photo saved');
+      });
+      return;
+    }
     const p = e.target.dataset.price;
     if (p && ui.detail) {
       const val = parseFloat(e.target.value) || 0;
@@ -559,6 +604,42 @@
 
   document.addEventListener('input', (e) => {
     if (e.target.id === 'searchBox') { ui.query = e.target.value; const m = $('main'); const scroll = m.scrollTop; render(); m.scrollTop = scroll; }
+  });
+
+  function wireSheet() {
+    const back = document.querySelector('.sheet-back');
+    const sh = back && back.querySelector('.sheet');
+    if (!sh || sh.dataset.wired) return;
+    sh.dataset.wired = '1';
+    const body = sh.querySelector('.sheet-body');
+    let startY = null, dy = 0;
+    const start = (y, target) => {
+      if (body.scrollTop > 3 && !target.closest('.grab')) return;
+      startY = y; dy = 0; sh.style.transition = 'none';
+    };
+    const move = (y) => {
+      if (startY == null) return;
+      dy = y - startY;
+      if (dy > 0) sh.style.transform = 'translateY(' + dy + 'px)';
+    };
+    const end = () => {
+      if (startY == null) return;
+      sh.style.transition = 'transform .22s cubic-bezier(.2,.9,.3,1)';
+      if (dy > 90) { sh.style.transform = 'translateY(100%)'; setTimeout(() => setUI({ sheet: null, detail: null }), 170); }
+      else sh.style.transform = '';
+      startY = null; dy = 0;
+    };
+    sh.addEventListener('touchstart', (e) => start(e.touches[0].clientY, e.target), { passive: true });
+    sh.addEventListener('touchmove', (e) => move(e.touches[0].clientY), { passive: true });
+    sh.addEventListener('touchend', end);
+    sh.addEventListener('touchcancel', end);
+    sh.addEventListener('mousedown', (e) => { start(e.clientY, e.target); });
+    window.addEventListener('mousemove', (e) => { if (startY != null) move(e.clientY); });
+    window.addEventListener('mouseup', end);
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && (ui.sheet || ui.detail)) setUI({ sheet: null, detail: null });
   });
 
   S.on(render);

@@ -1,102 +1,56 @@
-# Trove
+// Catalog seed + real marketplace link builders.
+(function () {
+  const q = encodeURIComponent;
 
-A price tracker for consoles, handhelds and games — for a household of two. Installs on your
-phone from the browser, keeps working offline, links straight to real listings, and does the
-buy-low / sell-high math with marketplace fees taken out.
+  const SOURCES = [
+    { key: 'ebay', name: 'eBay', kind: 'resale', url: (n) => `https://www.ebay.com/sch/i.html?_nkw=${q(n)}&LH_BIN=1&_sop=15` },
+    { key: 'mercari', name: 'Mercari', kind: 'resale', url: (n) => `https://www.mercari.com/search/?keyword=${q(n)}&sortBy=2` },
+    { key: 'fbmp', name: 'FB Marketplace', kind: 'resale', url: (n) => `https://www.facebook.com/marketplace/search/?query=${q(n)}` },
+    { key: 'offerup', name: 'OfferUp', kind: 'resale', url: (n) => `https://offerup.com/search?q=${q(n)}` },
+    { key: 'bestbuy', name: 'Best Buy', kind: 'retail', url: (n) => `https://www.bestbuy.com/site/searchpage.jsp?st=${q(n)}` },
+    { key: 'walmart', name: 'Walmart', kind: 'retail', url: (n) => `https://www.walmart.com/search?q=${q(n)}` },
+    { key: 'amazon', name: 'Amazon', kind: 'retail', url: (n) => `https://www.amazon.com/s?k=${q(n)}` },
+    { key: 'gamestop', name: 'GameStop', kind: 'retail', url: (n) => `https://www.gamestop.com/search/?q=${q(n)}` },
+  ];
 
-It runs in three tiers. **Tier 0 works the moment you publish it — no accounts, no keys.**
+  const soldComps = (n) => `https://www.ebay.com/sch/i.html?_nkw=${q(n)}&LH_Sold=1&LH_Complete=1&_sop=13`;
+  const priceCharting = (n) => `https://www.pricecharting.com/search-products?q=${q(n)}&type=prices`;
 
-| Tier | What you get | What it needs |
-| --- | --- | --- |
-| 0 | Full app on both phones, saved data, real buy links, manual prices | nothing |
-| 1 | One shared watchlist + ledger, synced live between phones | free Supabase project |
-| 2 | Live eBay prices with a refresh button | free eBay developer keys |
+  // Starting catalog. Prices are a starting point — refresh or edit them in the app.
+  const SEED = [
+    { id: 'switch2', name: 'Nintendo Switch 2', kind: 'console', buy: 449, sell: 512, cond: 'new' },
+    { id: 'deck', name: 'Steam Deck OLED 1TB', kind: 'handheld', buy: 549, sell: 638, cond: 'new' },
+    { id: 'ally', name: 'ROG Ally X', kind: 'handheld', buy: 649, sell: 690, cond: 'new' },
+    { id: 'pocket', name: 'Analogue Pocket', kind: 'handheld', buy: 219, sell: 335, cond: 'new' },
+    { id: 'playdate', name: 'Playdate console', kind: 'handheld', buy: 199, sell: 245, cond: 'new' },
+    { id: 'gbasp', name: 'Game Boy Advance SP AGS-101', kind: 'retro', buy: 118, sell: 189, cond: 'used' },
+    { id: 'dslite', name: 'Nintendo DS Lite', kind: 'retro', buy: 62, sell: 104, cond: 'used' },
+    { id: 'vita', name: 'PS Vita Slim PCH-2000', kind: 'handheld', buy: 165, sell: 232, cond: 'used' },
+    { id: 'gc', name: 'Nintendo GameCube console', kind: 'retro', buy: 105, sell: 168, cond: 'used' },
+    { id: 'n64', name: 'Nintendo 64 console', kind: 'retro', buy: 88, sell: 132, cond: 'used' },
+    { id: 'procon', name: 'Switch 2 Pro Controller', kind: 'accessory', buy: 79, sell: 96, cond: 'new' },
+    { id: 'dock', name: 'Steam Deck Docking Station', kind: 'accessory', buy: 79, sell: 99, cond: 'new' },
+    { id: 'emerald', name: 'Pokemon Emerald GBA', kind: 'game', buy: 92, sell: 148, cond: 'used' },
+    { id: 'chrono', name: 'Chrono Trigger SNES CIB', kind: 'game', buy: 260, sell: 395, cond: 'cib' },
+    { id: 'por', name: 'Fire Emblem Path of Radiance GameCube', kind: 'game', buy: 180, sell: 265, cond: 'used' },
+    { id: 'muramasa', name: 'Muramasa Rebirth PS Vita', kind: 'game', buy: 74, sell: 126, cond: 'cib' },
+  ];
 
----
+  const KINDS = [
+    { key: 'all', label: 'Everything' },
+    { key: 'handheld', label: 'Handhelds' },
+    { key: 'retro', label: 'Retro' },
+    { key: 'console', label: 'Consoles' },
+    { key: 'game', label: 'Games' },
+    { key: 'accessory', label: 'Accessories' },
+  ];
 
-## Tier 0 — publish it (5 minutes)
+  const CONDS = [
+    { key: 'new', label: 'New' },
+    { key: 'used', label: 'Used' },
+    { key: 'cib', label: 'CIB' },
+    { key: 'sealed', label: 'Sealed' },
+  ];
 
-1. Put the contents of this `app/` folder at the **root of the repo** (so `index.html` sits at the top level).
-2. Repo → **Settings → Pages** → Branch `main`, folder `/ (root)` → **Save**.
-3. Wait a minute, then open `https://<your-username>.github.io/trove/` on your iPhone **in Safari**.
-4. Share button → **Add to Home Screen** → Add.
-5. Send your wife the same URL so she adds it too.
-
-That's a real installed app: full screen, no browser chrome, opens offline, data survives restarts.
-
-**Watch out for:** the file must be named exactly `index.html` (not `index.html.html`), and Pages
-serves from HTTPS — required for the offline service worker to register.
-
-### Using it
-- **Trending** ranks everything you track by net profit. Sort by dollars, percentage, or cheapest.
-- **+** in the header adds anything — type it the way you'd search eBay, because that text drives every buy link.
-- Tapping an item opens the detail sheet: edit buy/sold prices, see the history curve, open Best Buy / Walmart / Amazon / GameStop / eBay / Mercari / FB Marketplace / OfferUp, jump to sold comps and PriceCharting, and set a target price.
-- **Watch** shows how far each target still has to fall.
-- **Ledger** records real flips with fees and shipping subtracted, and totals your actual profit.
-- **You** holds fee assumptions, default venue, JSON export, and sync setup.
-
----
-
-## Tier 1 — sync between two phones
-
-1. Create a free project at [supabase.com](https://supabase.com).
-2. SQL Editor → paste `supabase/schema.sql` → **Run**.
-3. Authentication → Providers → **Email** → enable magic links.
-4. Project Settings → API → copy the **Project URL** and the **anon public key**.
-5. Edit `config.js`, paste both in, commit. (The anon key is designed to be public — row-level
-   security in the schema is what protects the data.)
-6. On your phone: You → **Sign in to sync** → enter your email → tap the link it sends.
-7. Your household gets an invite code. Your wife signs in on her phone, enters that code, and
-   both phones now read and write the same watchlist, items and ledger — live.
-
----
-
-## Tier 2 — live prices
-
-1. Register at [developer.ebay.com](https://developer.ebay.com), create a **production** keyset,
-   and copy the App ID (client id) and Cert ID (client secret).
-2. Install the Supabase CLI, then from the repo root:
-
-   ```bash
-   supabase login
-   supabase link --project-ref <your-project-ref>
-   supabase secrets set EBAY_CLIENT_ID=xxx EBAY_CLIENT_SECRET=yyy
-   supabase functions deploy prices --no-verify-jwt
-   ```
-3. Put the function URL in `config.js` as `PRICES_ENDPOINT`
-   (`https://<ref>.supabase.co/functions/v1/prices`), commit.
-4. In the app, the refresh icon on any item now pulls live eBay listings, updates the buy price,
-   and records a point on the history curve.
-
-**Honest caveat:** eBay's Browse API gives *live asking prices*. Real **sold** comps come from the
-Marketplace Insights API, which eBay grants on application. Until you're approved, the function
-estimates the sold median from live listings and flags it with `soldMedianIsEstimate`. Retail
-prices (Best Buy, Walmart, Amazon) are link-outs — their public APIs are partner-gated, so the
-app sends you to the search page rather than pretending to know the price.
-
-### Keeping prices fresh automatically
-In Supabase → Database → **Cron**, schedule a job that calls the function for your watched items
-(hourly is plenty, and stays inside eBay's 5,000 calls/day free tier).
-
----
-
-## Files
-
-```
-index.html              app shell + all styling
-config.js               your keys and fee assumptions   ← the only file you normally edit
-data.js                 starting catalog + marketplace link builders
-store.js                local-first storage, optional Supabase sync
-app.js                  screens, sheets, interactions
-sw.js                   offline cache
-manifest.webmanifest    home-screen install metadata
-icons/                  app icons
-supabase/schema.sql     households + memberships + row-level security
-supabase/functions/prices/index.ts   eBay price service
-```
-
-## What this deliberately does not do
-
-No buying, listing or payments on your behalf — Trove hands you a link and you finish the purchase
-on the marketplace. No scraping of sites that forbid it. No price guarantees: treat every number as
-a lead, and check the listing before you buy.
+  window.TroveData = { SOURCES, SEED, KINDS, CONDS, soldComps, priceCharting };
+})();

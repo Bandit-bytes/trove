@@ -1,16 +1,16 @@
-{
-  "name": "Trove — buy low, sell high",
-  "short_name": "Trove",
-  "description": "Track console, handheld and game prices across retail and resale, and see the real margin.",
-  "start_url": "./index.html",
-  "scope": "./",
-  "display": "standalone",
-  "orientation": "portrait",
-  "background_color": "#f5ead8",
-  "theme_color": "#f5ead8",
-  "icons": [
-    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
-    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
-    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
-  ]
-}
+// Trove configuration.
+// Tier 0 works with no keys at all (local data on the phone).
+// Fill these in to unlock sync and live prices — see README.md.
+window.TROVE_CONFIG = {
+  // --- Tier 1: cloud sync between phones (Supabase, free tier) ---
+  SUPABASE_URL: '',       // e.g. 'https://abcdefgh.supabase.co'
+  SUPABASE_ANON_KEY: '',  // the public "anon" key — safe in a public repo
+
+  // --- Tier 2: live prices (a Supabase Edge Function that talks to eBay) ---
+  // Leave empty to keep entering prices by hand.
+  PRICES_ENDPOINT: '',    // e.g. 'https://abcdefgh.supabase.co/functions/v1/prices'
+
+  // Marketplace fee assumptions used for net-margin math
+  FEES: { ebay: 0.1325, mercari: 0.10, whatnot: 0.08, local: 0 },
+  FEE_FLAT: 0.30,
+};

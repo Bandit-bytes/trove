@@ -152,6 +152,8 @@ input.in,select.in{width:100%;min-height:46px;padding:8px 16px;background:var(--
 .stat span{font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--n-600)}
 .cab .stat,.cab-sage .stat{background:rgba(255,255,255,.1)}
 .cab .stat span{color:var(--accent-300)} .cab-sage .stat span{color:var(--sage-300)}
+.spin{animation:spin 1.1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 .bar{height:8px;border-radius:999px;background:var(--n-300);overflow:hidden}
 .bar>i{display:block;height:100%;border-radius:999px;background:var(--accent-600)}
 .switch{width:46px;height:28px;border-radius:999px;border:0;padding:3px;display:flex;background:var(--n-400);cursor:pointer}
@@ -406,7 +408,19 @@ window.TROVE_CONFIG = {
     return freshState();
   }
 
-  function emit() { listeners.forEach((fn) => fn(state)); }
+  let batching = 0, batchDirty = false;
+  function emit() {
+    if (batching) { batchDirty = true; return; }
+    listeners.forEach((fn) => fn(state));
+  }
+  async function batch(fn) {
+    batching++;
+    try { return await fn(); }
+    finally {
+      batching--;
+      if (!batching && batchDirty) { batchDirty = false; emit(); }
+    }
+  }
 
   function persist(push = true) {
     state.updatedAt = Date.now();
@@ -766,14 +780,18 @@ window.TROVE_CONFIG = {
     },
 
     // Fill in missing artwork in the background, a few at a time.
+    // Photos are fetched ONCE and stored on the item; the screen repaints once at the end.
     async autoArt(onProgress) {
       const todo = state.items.filter((i) => !i.image && !i.autoImage && !i.artTried);
-      for (let k = 0; k < todo.length; k += 3) {
-        await Promise.all(todo.slice(k, k + 3).map((it) => Store.fetchArt(it).catch(() => {
-          Store.update((st2) => { const x = st2.items.find((i) => i.id === it.id); if (x) x.artTried = true; });
-        })));
-        if (onProgress) onProgress(Math.min(k + 3, todo.length), todo.length);
-      }
+      if (!todo.length) return 0;
+      await batch(async () => {
+        for (let k = 0; k < todo.length; k += 3) {
+          await Promise.all(todo.slice(k, k + 3).map((it) => Store.fetchArt(it).catch(() => {
+            Store.update((st2) => { const x = st2.items.find((i) => i.id === it.id); if (x) x.artTried = true; });
+          })));
+          if (onProgress) onProgress(Math.min(k + 3, todo.length), todo.length);
+        }
+      });
       return todo.length;
     },
 
@@ -822,12 +840,14 @@ window.TROVE_CONFIG = {
       const all = state.items.filter((i) => force || !i.refreshedAt || Date.now() - i.refreshedAt > maxAge);
       const due = force ? all : all.slice(0, 8);
       let done = 0;
-      for (let k = 0; k < due.length; k += 2) {
-        await Promise.all(due.slice(k, k + 2).map((it) => Store.refreshPrice(it).catch(() => {})));
-        done = Math.min(k + 2, due.length);
-        if (onProgress) onProgress(done, due.length);
-        await new Promise((r) => setTimeout(r, 400));
-      }
+      await batch(async () => {
+        for (let k = 0; k < due.length; k += 2) {
+          await Promise.all(due.slice(k, k + 2).map((it) => Store.refreshPrice(it).catch(() => {})));
+          done = Math.min(k + 2, due.length);
+          if (onProgress) onProgress(done, due.length);
+          await new Promise((r) => setTimeout(r, 300));
+        }
+      });
       return done;
     },
 
@@ -837,6 +857,7 @@ window.TROVE_CONFIG = {
     priceError: null,
 
     initCloud,
+    batch,
   };
 
   window.TroveStore = Store;
@@ -1000,73 +1021,110 @@ window.TROVE_CONFIG = {
   }
 
   // ---------- barcode scanner ----------
-  // Native BarcodeDetector where it exists (Android/Chrome), ZXing everywhere else (iOS).
   const SCANLOG_KEY = 'trove.scans.v1';
-  const scan = { code: null, busy: false, result: null, err: null, kind: 'game', cond: 'used', engine: null,
+  const scan = { code: null, busy: false, result: null, err: null, kind: null, cond: 'used', engine: null,
     log: (() => { try { return JSON.parse(localStorage.getItem(SCANLOG_KEY) || '[]'); } catch (e) { return []; } })() };
   const saveScans = () => { try { localStorage.setItem(SCANLOG_KEY, JSON.stringify(scan.log.slice(0, 40))); } catch (e) {} };
-  let scanVideo = null, scanStream = null, scanTimer = null, scanReader = null;
+  let scanVideo = null, scanStream = null, scanTimer = null, scanReader = null, scanStarting = false;
+
+  // ZXing ships a plain browser build; load that first — module CDNs are the flakier path.
+  async function loadZX() {
+    if (window.ZXing) return window.ZXing;
+    await new Promise((res) => {
+      const el = document.createElement('script');
+      el.src = 'https://cdn.jsdelivr.net/npm/@zxing/library@0.19.1/umd/index.min.js';
+      el.onload = res; el.onerror = res;
+      document.head.appendChild(el);
+    });
+    if (window.ZXing) return window.ZXing;
+    return await import('https://esm.sh/@zxing/library@0.21.3');
+  }
 
   async function startScan() {
-    if (scanStream) return;
-    scan.err = null;
+    if (scanStarting) return;
+    scanStarting = true;
+    stopScan();                                   // always start from a clean slate
+    scan.err = null; scan.engine = 'starting'; render();
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      scan.engine = null;
       scan.err = 'This browser can’t open the camera. Type the numbers under the barcode instead.';
-      return render();
+      scanStarting = false; return render();
     }
     try {
       scanStream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 } }, audio: false });
+        audio: false,
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      });
     } catch (err) {
-      scanStream = null;
+      scanStream = null; scan.engine = null;
       scan.err = err && err.name === 'NotAllowedError'
-        ? 'Camera access is off. Turn it on for this site, or type the numbers under the barcode.'
+        ? 'Camera access is blocked for this site. Allow it in your browser settings, then tap Start camera.'
         : 'No camera available — type the numbers under the barcode.';
-      return render();
+      scanStarting = false; return render();
     }
-    if (!scanVideo) {
-      scanVideo = document.createElement('video');
-      scanVideo.setAttribute('playsinline', '');
-      scanVideo.setAttribute('muted', '');
-      scanVideo.muted = true; scanVideo.autoplay = true;
-      scanVideo.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block';
-    }
+    // keep the lens hunting for focus at close range where barcodes live
+    try {
+      const track = scanStream.getVideoTracks()[0];
+      const caps = track.getCapabilities ? track.getCapabilities() : {};
+      if (caps.focusMode && caps.focusMode.includes('continuous')) await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+    } catch (err) {}
+
+    scanVideo = document.createElement('video');
+    scanVideo.setAttribute('playsinline', '');
+    scanVideo.setAttribute('autoplay', '');
+    scanVideo.setAttribute('muted', '');
+    scanVideo.muted = true;
+    scanVideo.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block';
     scanVideo.srcObject = scanStream;
     try { await scanVideo.play(); } catch (err) {}
     mountScan();
-    render();
 
-    const FORMATS = ['ean_13', 'upc_a', 'upc_e', 'ean_8', 'code_128'];
-    scan.engine = 'starting';
+    const FORMATS = ['ean_13', 'upc_a', 'upc_e', 'ean_8', 'code_128', 'code_39', 'itf'];
     if ('BarcodeDetector' in window) {
-      scan.engine = 'native';
-      let det;
-      try { det = new window.BarcodeDetector({ formats: FORMATS }); } catch (err) { det = new window.BarcodeDetector(); }
-      scanTimer = setInterval(async () => {
-        if (!scanVideo || !scanStream || scan.busy) return;
-        try { const hits = await det.detect(scanVideo); if (hits && hits.length) onCode(hits[0].rawValue); }
-        catch (err) {}
-      }, 320);
-      return;
+      let det = null;
+      try { det = new window.BarcodeDetector({ formats: FORMATS }); }
+      catch (err) { try { det = new window.BarcodeDetector(); } catch (e2) { det = null; } }
+      if (det) {
+        scan.engine = 'native';
+        scanTimer = setInterval(async () => {
+          if (!scanVideo || !scanStream || scan.busy || scan.code) return;
+          try { const hits = await det.detect(scanVideo); if (hits && hits.length) onCode(hits[0].rawValue); }
+          catch (err) {}
+        }, 300);
+        scanStarting = false; return render();
+      }
     }
     try {
-      const zx = await import('https://esm.sh/@zxing/library@0.21.3');
+      const ZX = await loadZX();
+      const hints = new Map();
+      hints.set(ZX.DecodeHintType.TRY_HARDER, true);
+      hints.set(ZX.DecodeHintType.POSSIBLE_FORMATS, [
+        ZX.BarcodeFormat.EAN_13, ZX.BarcodeFormat.UPC_A, ZX.BarcodeFormat.EAN_8,
+        ZX.BarcodeFormat.UPC_E, ZX.BarcodeFormat.CODE_128, ZX.BarcodeFormat.CODE_39]);
+      scanReader = new ZX.BrowserMultiFormatReader(hints, 180);
       scan.engine = 'zxing'; render();
-      scanReader = new zx.BrowserMultiFormatReader();
-      scanReader.decodeFromVideoElement(scanVideo, (res) => { if (res && !scan.busy) onCode(res.getText()); })
-        .catch(() => {});
+      scanReader.decodeFromVideoElement(scanVideo, (res) => {
+        if (res && !scan.busy && !scan.code) onCode(res.getText());
+      }).catch(() => {});
     } catch (err) {
       scan.engine = null;
-      scan.err = 'The scanner library couldn’t load — type the numbers under the barcode.';
+      scan.err = 'The scanner couldn’t start — type the numbers under the barcode.';
       render();
     }
+    scanStarting = false;
   }
 
   function stopScan() {
-    clearInterval(scanTimer); scanTimer = null; scan.engine = null;
+    clearInterval(scanTimer); scanTimer = null;
+    scan.engine = null;
     if (scanReader) { try { scanReader.reset(); } catch (err) {} scanReader = null; }
-    if (scanStream) { scanStream.getTracks().forEach((t) => t.stop()); scanStream = null; }
-    if (scanVideo) { scanVideo.srcObject = null; if (scanVideo.parentNode) scanVideo.parentNode.removeChild(scanVideo); }
+    if (scanStream) { scanStream.getTracks().forEach((t) => { try { t.stop(); } catch (e) {} }); scanStream = null; }
+    if (scanVideo) {
+      try { scanVideo.pause(); } catch (err) {}
+      scanVideo.srcObject = null;
+      if (scanVideo.parentNode) scanVideo.parentNode.removeChild(scanVideo);
+      scanVideo = null;
+    }
   }
 
   function mountScan() {
@@ -1074,19 +1132,25 @@ window.TROVE_CONFIG = {
     if (host && scanVideo && scanVideo.parentNode !== host) host.insertBefore(scanVideo, host.firstChild);
   }
 
-  async function onCode(code) {
+  // A barcode alone is ambiguous, so we hold it and ask what kind of thing it is.
+  function onCode(code) {
     code = String(code || '').replace(/\D/g, '');
     if (!code || scan.busy || code === scan.code) return;
-    scan.busy = true; scan.code = code; scan.err = null; scan.result = null;
+    scan.code = code; scan.result = null; scan.err = null;
     if (navigator.vibrate) navigator.vibrate(30);
     render();
+  }
+
+  async function priceCode() {
+    if (!scan.code || !scan.kind) return;
+    scan.busy = true; scan.err = null; render();
     try {
-      const r = await S.quickLook(code, scan.cond, 'en', scan.kind);
-      r.code = code;
+      const r = await S.quickLook(scan.code, scan.cond, 'en', scan.kind);
+      r.code = scan.code;
       scan.result = r;
       const name = (r.market && r.market.title) || r.query;
-      scan.log = [{ code, name, market: Math.round(r.soldMedian || 0), image: r.image || null,
-        kind: scan.kind, cond: scan.cond, t: Date.now() }].concat(scan.log.filter((x) => x.code !== code)).slice(0, 40);
+      scan.log = [{ code: scan.code, name, market: Math.round(r.soldMedian || 0), image: r.image || null,
+        kind: scan.kind, cond: scan.cond, t: Date.now() }].concat(scan.log.filter((x) => x.code !== scan.code)).slice(0, 40);
       saveScans();
     } catch (err) { scan.err = err.message; }
     scan.busy = false;
@@ -1182,16 +1246,41 @@ window.TROVE_CONFIG = {
     </button>`;
   }
 
+  // ---------- refresh bar ----------
+  function refreshBarHtml() {
+    const r = ui.refresh;
+    if (r) {
+      const pct = r.total ? Math.round((r.done / r.total) * 100) : 8;
+      return `<div style="background:var(--sage-100);border-radius:20px;padding:11px 14px">
+        <div style="display:flex;align-items:center;gap:9px">
+          <span class="spin" style="color:var(--sage-700);display:grid;place-items:center">${svg(ICON.refresh, 17)}</span>
+          <span style="flex:1;font-size:12px;font-weight:700;color:var(--sage-800)">Checking prices — ${r.done} of ${r.total || '…'}</span>
+          <span class="disp" style="font-size:13px;color:var(--sage-800)">${pct}%</span>
+        </div>
+        <div class="bar" style="margin-top:9px;background:var(--sage-200)"><i style="width:${Math.max(4, pct)}%;background:var(--sage-700);transition:width .3s ease"></i></div>
+      </div>`;
+    }
+    return `<button class="row" data-refreshall="1" style="min-height:0;padding:9px 13px;background:var(--sage-100);box-shadow:none">
+        <span style="color:var(--sage-700);display:grid;place-items:center">${svg(ICON.refresh, 17)}</span>
+        <span style="flex:1;font-size:12px;font-weight:700;color:var(--sage-800)">Prices last checked ${lastCheckedText()} — tap to re-check</span>
+      </button>`;
+  }
+  function lastCheckedText() {
+    const ts = (st().items || []).map((i) => i.refreshedAt || 0).filter(Boolean);
+    return ts.length ? ago(Math.max.apply(null, ts)) : 'never';
+  }
+  function paintRefreshBar() {
+    const el = $('refreshBar');
+    if (el) el.innerHTML = refreshBarHtml();
+  }
+
   // ---------- screens ----------
   function browseScreen() {
     const list = catalog();
     const steals = list.filter((i) => deal(i) >= 0.38).length;
     const sorts = [['steal', 'Steals'], ['cheap', 'Cheapest'], ['value', 'Top value'], ['az', 'A–Z']];
     return `<div class="screen">
-      <button class="row" data-refreshall="1" style="margin:4px 0 10px;min-height:0;padding:9px 13px;background:var(--sage-100);box-shadow:none">
-        <span style="color:var(--sage-700);display:grid;place-items:center">${svg(ICON.refresh, 17)}</span>
-        <span style="flex:1;font-size:12px;font-weight:700;color:var(--sage-800)">Live market values on${S.pricesOn && !S.priceError ? ' + eBay listings' : ''} — tap to re-check everything</span>
-      </button>
+      <div id="refreshBar" style="margin:4px 0 10px">${refreshBarHtml()}</div>
       <div class="search" style="margin:4px 0 12px">
         ${svg(ICON.search, 18)}
         <input id="searchBox" placeholder="Search consoles, handhelds, games…" value="${esc(ui.q)}" autocomplete="off">
@@ -1722,54 +1811,51 @@ window.TROVE_CONFIG = {
   function scanSheet() {
     const r = scan.result;
     const live = !!scanStream;
-    const fake = r && { id: 'scan', name: (r.market && r.market.title) || r.query, kind: scan.kind, cond: scan.cond, sell: r.soldMedian || 0 };
+    const fake = r && { id: 'scan', name: (r.market && r.market.title) || r.query, kind: scan.kind || 'game', cond: scan.cond, sell: r.soldMedian || 0 };
+    const kinds = [["game","Game"],["console","Console"],["handheld","Handheld"],["accessory","Accessory"]];
+    const conds = [["loose","Loose"],["used","Used"],["cib","CIB"],["sealed","Sealed"]];
+
     return sheet(`<h4 style="margin:0 0 4px">Scan a barcode</h4>
-      <p class="muted" style="font-size:12.5px">Point at the barcode on the box or case. Works on sealed and boxed games — loose carts have no barcode, so type those in.</p>
+      <p class="muted" style="font-size:12.5px">Hold the barcode in the frame. It grabs whatever it sees — then you say what it is, and Trove prices it.</p>
 
       <div id="scanView" style="position:relative;margin-top:12px;aspect-ratio:4/3;border-radius:24px;overflow:hidden;
         background:linear-gradient(155deg,#402310,#2b1a11);display:grid;place-items:center">
         ${live ? `<div style="position:absolute;inset:0;pointer-events:none">
-            <div style="position:absolute;inset:16% 10%;border-radius:16px;box-shadow:0 0 0 2000px rgba(20,12,8,.42)"></div>
-            <div style="position:absolute;left:10%;right:10%;top:50%;height:2px;background:var(--accent-300);opacity:.9"></div>
+            <div style="position:absolute;inset:22% 8%;border-radius:14px;box-shadow:0 0 0 2000px rgba(20,12,8,.40);border:2px solid rgba(255,198,165,.55)"></div>
+            <div style="position:absolute;left:8%;right:8%;top:50%;height:2px;background:var(--accent-300)"></div>
           </div>`
         : `<div style="text-align:center;padding:22px;position:relative">
             <div style="color:var(--accent-300)">${svg(ICON.scan, 34)}</div>
-            <div class="kicker" style="margin-top:10px;color:var(--accent-300)">${scan.err ? 'Camera off' : 'Camera is off'}</div>
-            <button class="btn" data-scanstart="1" style="margin-top:12px;background:var(--accent-300);color:var(--accent-900)">Turn on the camera</button>
+            <button class="btn" data-scanstart="1" style="margin-top:12px;background:var(--accent-300);color:var(--accent-900)">Start camera</button>
           </div>`}
       </div>
 
-      ${live ? `<div class="kicker" style="margin-top:9px">${scan.engine === 'native' ? 'Scanner running · hold the barcode steady in the frame'
-        : scan.engine === 'zxing' ? 'Scanner running (fallback reader) · hold steady'
-        : 'Starting the scanner…'}</div>` : ''}
-      ${scan.err ? `<div class="card" style="margin-top:10px;background:var(--accent-100)">
-          <div style="font-size:12.5px;font-weight:700;color:var(--accent-800)">${esc(scan.err)}</div>
-          <button class="btn btn-secondary" data-sheet="quick" style="margin-top:10px;font-size:12.5px">Search by title instead</button>
+      ${live ? `<div style="display:flex;align-items:center;gap:9px;margin-top:9px">
+          <span class="kicker" style="flex:1">${scan.engine === 'starting' ? 'Starting the scanner…' : 'Scanning — hold steady, fill the frame'}</span>
+          <button class="btn btn-ghost" data-scanstop="1" style="font-size:11.5px">Stop camera</button>
         </div>` : ''}
 
-      <div style="display:flex;gap:9px;margin-top:10px">
-        <select class="in" id="scanKind" style="flex:1">
-          <option value="game" ${scan.kind === 'game' ? 'selected' : ''}>Game</option>
-          <option value="console" ${scan.kind === 'console' ? 'selected' : ''}>Console</option>
-          <option value="handheld" ${scan.kind === 'handheld' ? 'selected' : ''}>Handheld</option>
-          <option value="accessory" ${scan.kind === 'accessory' ? 'selected' : ''}>Accessory</option>
-        </select>
-        <select class="in" id="scanCond" style="flex:1">
-          <option value="loose" ${scan.cond === 'loose' ? 'selected' : ''}>Loose</option>
-          <option value="used" ${scan.cond === 'used' ? 'selected' : ''}>Used</option>
-          <option value="cib" ${scan.cond === 'cib' ? 'selected' : ''}>CIB</option>
-          <option value="sealed" ${scan.cond === 'sealed' ? 'selected' : ''}>Sealed</option>
-        </select>
-      </div>
+      ${scan.err ? `<div class="card" style="margin-top:10px;background:var(--accent-100)">
+          <div style="font-size:12.5px;font-weight:700;color:var(--accent-800)">${esc(scan.err)}</div>
+          <div style="display:flex;gap:8px;margin-top:10px">
+            <button class="btn btn-secondary" data-scanstart="1" style="font-size:12.5px">Try camera again</button>
+            <button class="btn btn-secondary" data-sheet="quick" style="font-size:12.5px">Search by title</button>
+          </div>
+        </div>` : ''}
 
-      <div style="display:flex;gap:9px;margin-top:9px">
-        <input class="in" id="scanManual" inputmode="numeric" placeholder="Or type the barcode digits" style="flex:1" autocomplete="off">
-        <button class="btn btn-secondary" data-scanmanual="1">Look up</button>
-      </div>
-
-      ${scan.busy ? `<div class="card" style="margin-top:14px;text-align:center">
-          <div class="disp" style="font-size:16px">Reading ${esc(scan.code || '')}…</div>
-          <p class="muted" style="font-size:11.5px;margin:6px 0 0">Pulling the market value</p>
+      ${scan.code && !r ? `<div class="card" style="margin-top:12px">
+          <div class="kicker">Barcode ${esc(scan.code)}</div>
+          <div class="disp" style="font-size:17px;margin-top:6px">What is it?</div>
+          <p class="muted" style="font-size:11.5px;margin:6px 0 0">Type and condition decide which price you get back.</p>
+          <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:11px">
+            ${kinds.map(([k, l]) => `<button class="btn ${scan.kind === k ? 'btn-primary' : 'btn-secondary'}" data-scankind="${k}" style="font-size:13px">${l}</button>`).join('')}
+          </div>
+          <div class="seg" style="margin-top:10px">
+            ${conds.map(([k, l]) => `<button data-scancond="${k}" aria-pressed="${scan.cond === k}">${l}</button>`).join('')}
+          </div>
+          <button class="btn ${scan.kind ? 'btn-sage' : 'btn-secondary'} btn-block" data-scanprice="1" style="margin-top:11px"
+            ${scan.kind ? '' : 'disabled'}>${scan.busy ? 'Checking the market…' : scan.kind ? 'Get the price' : 'Pick a type first'}</button>
+          <button class="btn btn-ghost btn-block" data-scanclear="1" style="margin-top:4px;font-size:12px">Discard this barcode</button>
         </div>` : ''}
 
       ${r ? `<div class="cab" style="margin-top:14px">
@@ -1801,11 +1887,16 @@ window.TROVE_CONFIG = {
         <button class="btn btn-secondary" data-scannext="1">Next</button>
       </div>` : ''}
 
-      ${scan.log.length ? `<div style="display:flex;align-items:baseline;margin:20px 0 8px">
-        <h4 style="margin:0">Scanned</h4>
-        <button class="btn btn-ghost" data-scanlogclear="1" style="margin-left:auto;font-size:11.5px">Clear</button>
+      <div style="display:flex;gap:9px;margin-top:12px">
+        <input class="in" id="scanManual" inputmode="numeric" placeholder="Type the barcode digits" style="flex:1" autocomplete="off">
+        <button class="btn btn-secondary" data-scanmanual="1">Use this</button>
       </div>
-      <div style="display:flex;flex-direction:column;gap:8px">
+
+      <div style="display:flex;align-items:baseline;margin:20px 0 8px">
+        <h4 style="margin:0">Scanned</h4>
+        ${scan.log.length ? `<button class="btn btn-ghost" data-scanlogclear="1" style="margin-left:auto;font-size:11.5px">Clear</button>` : ''}
+      </div>
+      ${scan.log.length ? `<div style="display:flex;flex-direction:column;gap:8px">
         ${scan.log.map((h, i) => `<div class="row" style="cursor:default;min-height:60px">
           ${h.image ? `<div class="art" style="width:38px;height:38px;background:#fff;flex:none"><img src="${esc(h.image)}" alt="" style="object-fit:contain;padding:3px"></div>` : ''}
           <div style="flex:1;min-width:0">
@@ -1814,7 +1905,10 @@ window.TROVE_CONFIG = {
           </div>
           <button class="btn btn-ghost" data-scanloghaul="${i}" style="font-size:11.5px;flex:none">+ Haul</button>
         </div>`).join('')}
-      </div>` : ''}`,
+      </div>`
+      : `<div style="text-align:center;padding:22px 16px;border:1px dashed var(--n-400);border-radius:22px">
+           <p class="muted" style="font-size:12px;margin:0">Everything you scan lands here with its price, so you can work down a shelf and decide at the end.</p>
+         </div>`}`,
       [`<button class="btn btn-secondary" data-close="1" style="flex:1">Done</button>`]);
   }
 
@@ -2095,7 +2189,10 @@ window.TROVE_CONFIG = {
       if (b) { b.focus({ preventScroll: true }); b.setSelectionRange(b.value.length, b.value.length); }
     }
     if (ui.tab === 'chat' && ui.draft) { const b = $('msgBox'); if (b) b.value = ui.draft; }
-    if (ui.sheet === 'scan') mountScan(); else if (scanStream) stopScan();
+    if (ui.sheet === 'scan') {
+      mountScan();
+      if (!scanStream && !scanStarting && !scan.err) setTimeout(startScan, 0);
+    } else if (scanStream) stopScan();
     wireSheet();
   }
 
@@ -2147,7 +2244,7 @@ window.TROVE_CONFIG = {
 
   // ---------- events ----------
   document.addEventListener('click', async (e) => {
-    const el = e.target.closest('[data-tab],[data-open],[data-close],[data-backdrop],[data-sheet],[data-sort],[data-kind],[data-plat],[data-era],[data-clearq],[data-watch],[data-unwatch],[data-refresh],[data-add],[data-logflip],[data-delflip],[data-togglefees],[data-signout],[data-sendlink],[data-verify],[data-join],[data-repair],[data-reset],[data-send],[data-unattach],[data-pickattach],[data-clearphoto],[data-tochat],[data-refreshall],[data-lookup],[data-quickadd],[data-copytitle],[data-arturl],[data-remove],[data-region],[data-margin],[data-hauladd],[data-haulrm],[data-haulclear],[data-haultrack],[data-scanstart],[data-scanmanual],[data-scannext],[data-scantrack],[data-scanhaul],[data-scanloghaul],[data-scanlogclear],[data-join2]');
+    const el = e.target.closest('[data-tab],[data-open],[data-close],[data-backdrop],[data-sheet],[data-sort],[data-kind],[data-plat],[data-era],[data-clearq],[data-watch],[data-unwatch],[data-refresh],[data-add],[data-logflip],[data-delflip],[data-togglefees],[data-signout],[data-sendlink],[data-verify],[data-join],[data-repair],[data-reset],[data-send],[data-unattach],[data-pickattach],[data-clearphoto],[data-tochat],[data-refreshall],[data-lookup],[data-quickadd],[data-copytitle],[data-arturl],[data-remove],[data-region],[data-margin],[data-hauladd],[data-haulrm],[data-haulclear],[data-haultrack],[data-scanstart],[data-scanstop],[data-scankind],[data-scancond],[data-scanprice],[data-scanclear],[data-scanmanual],[data-scannext],[data-scantrack],[data-scanhaul],[data-scanloghaul],[data-scanlogclear],[data-join2]');
     if (!el) return;
     const d = el.dataset;
     if (el.tagName === 'A') return;
@@ -2190,11 +2287,18 @@ window.TROVE_CONFIG = {
     }
 
     if (d.refreshall) {
-      toast('Re-checking prices…');
+      if (ui.refresh) return;
+      ui.refresh = { done: 0, total: 0 };
+      paintRefreshBar();
       try {
-        const n = await S.refreshStale(true, (done, total) => { if (done % 6 === 0) toast('Checked ' + done + ' of ' + total + '…'); });
+        const n = await S.refreshStale(true, (done, total) => {
+          ui.refresh = { done, total };
+          paintRefreshBar();
+        });
+        ui.refresh = null;
+        render();
         toast(n ? 'Updated ' + n + ' prices' : 'Nothing to update');
-      } catch (err) { toast(err.message); }
+      } catch (err) { ui.refresh = null; render(); toast(err.message); }
       return;
     }
     if (d.lookup) {
@@ -2211,13 +2315,39 @@ window.TROVE_CONFIG = {
       catch (err) { ui.quick = null; render(); toast(err.message); }
       return;
     }
-    if (d.scanstart) { return startScan(); }
+    if (d.scanstart) { scan.err = null; return startScan(); }
+    if (d.scanstop) { stopScan(); return render(); }
+    if (d.scankind) { scan.kind = d.scankind; return render(); }
+    if (d.scancond) { scan.cond = d.scancond; if (scan.result) { scan.result = null; } return render(); }
+    if (d.scanprice) { return priceCode(); }
+    if (d.scanclear) { scan.code = null; scan.result = null; scan.err = null; return render(); }
     if (d.scanmanual) {
       const code = ((($('scanManual') || {}).value) || '').replace(/\D/g, '');
       if (code.length < 8) return toast('Type all the digits under the barcode — usually 12');
       scan.code = null;
-      toast('Looking up ' + code + '…');
-      return onCode(code);
+      onCode(code);
+      return;
+    }
+    if (d.scannext) {
+      scan.code = null; scan.result = null; scan.err = null;
+      render();
+      if (!scanStream) startScan();
+      return;
+    }
+    if (d.scantrack && scan.result) {
+      const id = trackResult(scan.result, scan.kind || 'game', scan.cond, 'en');
+      stopScan();
+      toast('Tracking it');
+      return setUI({ sheet: null, detail: id });
+    }
+    if (d.scanhaul && scan.result) {
+      const r = scan.result, name = (r.market && r.market.title) || r.query, market = Math.round(r.soldMedian || 0);
+      haul.push({ name, market, kind: scan.kind || 'game', cond: scan.cond, region: 'en', image: r.image || null,
+        max: maxBuy({ id: name, kind: scan.kind || 'game', cond: scan.cond, sell: market }), ask: 0 });
+      saveHaul();
+      scan.code = null; scan.result = null;
+      toast(name + ' added to the haul — ' + money(market));
+      return render();
     }
     if (d.scanlogclear) { scan.log = []; saveScans(); return render(); }
     if (d.scanloghaul) {
@@ -2227,22 +2357,6 @@ window.TROVE_CONFIG = {
         max: maxBuy({ id: h.name, kind: h.kind, cond: h.cond, sell: h.market }), ask: 0 });
       saveHaul();
       return toast(h.name + ' added to the haul');
-    }
-    if (d.scannext) { scan.code = null; scan.result = null; scan.err = null; render(); if (!scanStream) startScan(); return; }
-    if (d.scantrack && scan.result) {
-      const id = trackResult(scan.result, scan.kind, scan.cond, 'en');
-      stopScan();
-      toast('Tracking it');
-      return setUI({ sheet: null, detail: id });
-    }
-    if (d.scanhaul && scan.result) {
-      const r = scan.result, name = (r.market && r.market.title) || r.query, market = Math.round(r.soldMedian || 0);
-      haul.push({ name, market, kind: scan.kind, cond: scan.cond, region: 'en', image: r.image || null,
-        max: maxBuy({ id: name, kind: scan.kind, cond: scan.cond, sell: market }), ask: 0 });
-      saveHaul();
-      scan.code = null; scan.result = null;
-      toast(name + ' added to the haul — ' + money(market));
-      return render();
     }
     if (d.hauladd) {
       const q = (($('haulBox') || {}).value || '').trim();
@@ -2454,8 +2568,6 @@ window.TROVE_CONFIG = {
     if (e.target.id === 'quickCond') { ui.quickCond = e.target.value; }
     if (e.target.id === 'quickKind') { ui.quickKind = e.target.value; }
     if (e.target.id === 'quickRegion') { ui.quickRegion = e.target.value; }
-    if (e.target.id === 'scanKind') { scan.kind = e.target.value; }
-    if (e.target.id === 'scanCond') { scan.cond = e.target.value; if (scan.code) { const c = scan.code; scan.code = null; onCode(c); } }
   });
 
   document.addEventListener('keydown', (e) => {
@@ -2485,9 +2597,8 @@ window.TROVE_CONFIG = {
   S.on(renderBg);
   render();
 
-  // Real product photos arrive on their own; live prices follow if configured.
+  // Photos are fetched once and kept on the item; prices only refresh when asked.
   S.autoArt().catch(() => {});
-  setTimeout(() => S.refreshStale(false).catch(() => {}), 3000);   // a few stale items per session
 })();
 
 </script>

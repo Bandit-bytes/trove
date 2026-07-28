@@ -399,6 +399,7 @@ window.TROVE_CONFIG = {
   let supa = null;
   let householdId = null;
   let channel = null;
+  let attaching = false, joining = false;
 
   function load() {
     try {
@@ -441,6 +442,14 @@ window.TROVE_CONFIG = {
   }
 
   async function attachHousehold() {
+    // Sign-in fires both a direct call and an auth-state event; without this guard the
+    // two race and the second one creates a *second* household — which read as "the app reset".
+    if (attaching || joining || householdId) return;
+    attaching = true;
+    try { await attachHouseholdInner(); } finally { attaching = false; }
+  }
+
+  async function attachHouseholdInner() {
     const { data: me } = await supa.auth.getUser();
     if (!me.user) return;
     let { data: rows } = await supa.from('memberships').select('household_id').eq('user_id', me.user.id).limit(1);
@@ -460,13 +469,33 @@ window.TROVE_CONFIG = {
     subscribe();
   }
 
-  async function pullRemote() {
+  // Joining a household must never overwrite what is already up there, and must never
+  // throw away what is on this phone: both sides get folded together, keyed by id.
+  function mergeStates(remote, local) {
+    const out = normalize(remote);
+    const byId = (arr) => { const m = {}; (arr || []).forEach((x) => { if (x && x.id) m[x.id] = x; }); return m; };
+    const rItems = byId(out.items);
+    (local.items || []).forEach((i) => { if (!rItems[i.id]) out.items.push(i); });
+    const rFlips = byId(out.flips);
+    (local.flips || []).forEach((f) => { if (!rFlips[f.id]) out.flips.push(f); });
+    const rMsgs = byId(out.messages);
+    (local.messages || []).forEach((m) => { if (!rMsgs[m.id]) out.messages.push(m); });
+    out.messages.sort((a, b) => (a.t || 0) - (b.t || 0));
+    out.messages = out.messages.slice(-300);
+    out.watch = Object.assign({}, local.watch || {}, out.watch || {});
+    return out;
+  }
+
+  async function pullRemote(adopt) {
     const { data } = await supa.from('households').select('data, code, name').eq('id', householdId).single();
-    if (data && data.data && data.data.updatedAt > (state.updatedAt || 0)) {
-      state = normalize({ ...data.data, inviteCode: data.code, householdName: data.name });
+    if (!data) return;
+    if (data.data && (adopt || data.data.updatedAt > (state.updatedAt || 0))) {
+      const merged = adopt ? mergeStates(data.data, state) : normalize(data.data);
+      state = normalize(Object.assign({}, merged, { inviteCode: data.code, householdName: data.name }));
       try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
       emit();
-    } else if (data) {
+      if (adopt) pushRemote();
+    } else {
       state.inviteCode = data.code;
       pushRemote();
     }
@@ -488,7 +517,9 @@ window.TROVE_CONFIG = {
         (payload) => {
           const remote = payload.new && payload.new.data;
           if (remote && remote.updatedAt > state.updatedAt) {
-            state = normalize(remote);
+            // A push from the other phone must not wipe anything this phone has added
+            // since — fold, don't replace.
+            state = mergeStates(remote, state);
             try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
             emit();
           }
@@ -670,21 +701,24 @@ window.TROVE_CONFIG = {
     async joinHousehold(code) {
       if (!supa) await initCloud();
       if (!supa) throw new Error('Cloud sync is not configured yet — see README.');
-      let { data: me } = await supa.auth.getUser();
-      if (!me || !me.user) {
-        // No email needed: a code holder joins as an anonymous member of the household.
-        const { data: anon, error: anonErr } = await supa.auth.signInAnonymously();
-        if (anonErr || !anon || !anon.user) {
-          throw new Error('Turn on “Allow anonymous sign-ins” in Supabase → Authentication → Sign In / Providers, then try the code again.');
+      joining = true;
+      try {
+        let { data: me } = await supa.auth.getUser();
+        if (!me || !me.user) {
+          // No email needed: a code holder joins as an anonymous member of the household.
+          const { data: anon, error: anonErr } = await supa.auth.signInAnonymously();
+          if (anonErr || !anon || !anon.user) {
+            throw new Error('Turn on “Allow anonymous sign-ins” in Supabase → Authentication → Sign In / Providers, then try the code again.');
+          }
+          me = { user: anon.user };
         }
-        me = { user: anon.user };
-      }
-      const { data: hh } = await supa.from('households').select('id').eq('code', code.trim().toUpperCase()).single();
-      if (!hh) throw new Error('No household with that code.');
-      await supa.from('memberships').insert({ user_id: me.user.id, household_id: hh.id });
-      householdId = hh.id;
-      await pullRemote();
-      subscribe();
+        const { data: hh } = await supa.from('households').select('id').eq('code', code.trim().toUpperCase()).single();
+        if (!hh) throw new Error('No household with that code.');
+        await supa.from('memberships').upsert({ user_id: me.user.id, household_id: hh.id });
+        householdId = hh.id;
+        await pullRemote(true);   // adopt + merge, never blank either side
+        subscribe();
+      } finally { joining = false; }
     },
 
     marketLookup,
@@ -917,7 +951,10 @@ window.TROVE_CONFIG = {
   let ui = { tab: 'browse', q: '', plat: 'all', kind: 'all', era: 'all', region: 'all', sort: 'steal', detail: null, sheet: null, attachItem: null, draft: '', authEmail: '' };
   let toastT = null, qT = null, haulT = null;
 
-  function setUI(patch) { Object.assign(ui, patch); render(); }
+  function setUI(patch) {
+    if (patch.tab === 'chat' && ui.tab !== 'chat') ui.chatBottom = true;
+    Object.assign(ui, patch); render();
+  }
   function toast(msg) {
     clearTimeout(toastT);
     $('overlay').insertAdjacentHTML('beforeend', `<div class="toast" id="toast">${esc(msg)}</div>`);
@@ -1026,6 +1063,7 @@ window.TROVE_CONFIG = {
     log: (() => { try { return JSON.parse(localStorage.getItem(SCANLOG_KEY) || '[]'); } catch (e) { return []; } })() };
   const saveScans = () => { try { localStorage.setItem(SCANLOG_KEY, JSON.stringify(scan.log.slice(0, 40))); } catch (e) {} };
   let scanVideo = null, scanStream = null, scanTimer = null, scanReader = null, scanStarting = false;
+  let scanCanvas = null, scanTicks = 0, scanStatT = null;
 
   // ZXing ships a plain browser build; load that first — module CDNs are the flakier path.
   async function loadZX() {
@@ -1079,20 +1117,15 @@ window.TROVE_CONFIG = {
     try { await scanVideo.play(); } catch (err) {}
     mountScan();
 
+    // Two engines, both fed the same cropped frames: the OS detector when the phone
+    // has one, ZXing as the universal fallback. Decoding a canvas beats handing the
+    // raw <video> over — we can crop to the reticle and upscale, which is what makes
+    // a small barcode in a wide frame actually readable.
     const FORMATS = ['ean_13', 'upc_a', 'upc_e', 'ean_8', 'code_128', 'code_39', 'itf'];
+    let det = null;
     if ('BarcodeDetector' in window) {
-      let det = null;
       try { det = new window.BarcodeDetector({ formats: FORMATS }); }
       catch (err) { try { det = new window.BarcodeDetector(); } catch (e2) { det = null; } }
-      if (det) {
-        scan.engine = 'native';
-        scanTimer = setInterval(async () => {
-          if (!scanVideo || !scanStream || scan.busy || scan.code) return;
-          try { const hits = await det.detect(scanVideo); if (hits && hits.length) onCode(hits[0].rawValue); }
-          catch (err) {}
-        }, 300);
-        scanStarting = false; return render();
-      }
     }
     try {
       const ZX = await loadZX();
@@ -1100,22 +1133,71 @@ window.TROVE_CONFIG = {
       hints.set(ZX.DecodeHintType.TRY_HARDER, true);
       hints.set(ZX.DecodeHintType.POSSIBLE_FORMATS, [
         ZX.BarcodeFormat.EAN_13, ZX.BarcodeFormat.UPC_A, ZX.BarcodeFormat.EAN_8,
-        ZX.BarcodeFormat.UPC_E, ZX.BarcodeFormat.CODE_128, ZX.BarcodeFormat.CODE_39]);
-      scanReader = new ZX.BrowserMultiFormatReader(hints, 180);
-      scan.engine = 'zxing'; render();
-      scanReader.decodeFromVideoElement(scanVideo, (res) => {
-        if (res && !scan.busy && !scan.code) onCode(res.getText());
-      }).catch(() => {});
-    } catch (err) {
+        ZX.BarcodeFormat.UPC_E, ZX.BarcodeFormat.CODE_128, ZX.BarcodeFormat.CODE_39, ZX.BarcodeFormat.ITF]);
+      scanReader = new ZX.BrowserMultiFormatReader(hints, 100);
+    } catch (err) { scanReader = null; }
+
+    if (!det && !scanReader) {
       scan.engine = null;
       scan.err = 'The scanner couldn’t start — type the numbers under the barcode.';
-      render();
+      scanStarting = false; return render();
     }
+    scan.engine = det && scanReader ? 'both' : det ? 'native' : 'zxing';
+    scanTicks = 0;
+    scanTimer = setInterval(() => { scanTick(det, scanReader); }, 180);
+    clearInterval(scanStatT);
+    scanStatT = setInterval(paintScanStat, 900);
     scanStarting = false;
+    render();
+  }
+
+  // One detection pass. Alternates full frame / zoomed centre crop so both a
+  // whole box held back and a barcode pushed right up to the lens can land.
+  let scanBusyTick = false;
+  async function scanTick(det, zx) {
+    if (scanBusyTick || !scanVideo || !scanStream || scan.busy || scan.code) return;
+    const vw = scanVideo.videoWidth, vh = scanVideo.videoHeight;
+    if (!vw || !vh) return;
+    scanBusyTick = true;
+    scanTicks++;
+    const crops = (scanTicks % 3 === 0)
+      ? [[0, 0, vw, vh, 1]]
+      : [[vw * 0.04, vh * 0.22, vw * 0.92, vh * 0.56, 2]];
+    try {
+      for (const [sx, sy, sw, sh, zoom] of crops) {
+        const c = scanCanvas || (scanCanvas = document.createElement('canvas'));
+        c.width = Math.round(sw * zoom); c.height = Math.round(sh * zoom);
+        const ctx = c.getContext('2d', { willReadFrequently: true });
+        ctx.drawImage(scanVideo, sx, sy, sw, sh, 0, 0, c.width, c.height);
+        if (det) {
+          try {
+            const hits = await det.detect(c);
+            if (hits && hits.length) { onCode(hits[0].rawValue); return; }
+          } catch (err) {}
+        }
+        if (zx) {
+          try {
+            const res = zx.decodeFromCanvas(c);
+            if (res) { onCode(res.getText()); return; }
+          } catch (err) {}
+        }
+      }
+    } finally { scanBusyTick = false; }
+  }
+
+  const scanStatText = () => (scan.engine === 'starting' || !scan.engine
+    ? 'Starting the scanner…'
+    : 'Scanning (' + scan.engine + ', ' + scanTicks + ' looks) — fill the frame, 4–6 in away');
+  function paintScanStat() {
+    const el = $('scanStat');
+    if (el) el.textContent = scanStatText();
+    else { clearInterval(scanStatT); scanStatT = null; }
   }
 
   function stopScan() {
     clearInterval(scanTimer); scanTimer = null;
+    clearInterval(scanStatT); scanStatT = null;
+    scanBusyTick = false;
     scan.engine = null;
     if (scanReader) { try { scanReader.reset(); } catch (err) {} scanReader = null; }
     if (scanStream) { scanStream.getTracks().forEach((t) => { try { t.stop(); } catch (e) {} }); scanStream = null; }
@@ -1831,7 +1913,7 @@ window.TROVE_CONFIG = {
       </div>
 
       ${live ? `<div style="display:flex;align-items:center;gap:9px;margin-top:9px">
-          <span class="kicker" style="flex:1">${scan.engine === 'starting' ? 'Starting the scanner…' : 'Scanning — hold steady, fill the frame'}</span>
+          <span class="kicker" id="scanStat" style="flex:1">${esc(scanStatText())}</span>
           <button class="btn btn-ghost" data-scanstop="1" style="font-size:11.5px">Stop camera</button>
         </div>` : ''}
 
@@ -2121,6 +2203,7 @@ window.TROVE_CONFIG = {
       rafId = null;
       const m = $('main');
       const sc = m ? m.scrollTop : 0;
+      const nearBot = !!m && ui.tab === 'chat' && (m.scrollHeight - m.scrollTop - m.clientHeight) < 90;
       const sb = document.querySelector('.sheet-body');
       const ssc = sb ? sb.scrollTop : 0;
       const snap = snapFields();
@@ -2130,6 +2213,11 @@ window.TROVE_CONFIG = {
       const sb2 = document.querySelector('.sheet-body');
       if (sb2 && ssc) sb2.scrollTop = ssc;
       restoreFields(snap);
+      if (ui.tab === 'chat' && (ui.chatBottom || nearBot)) {
+        const mm = $('main');
+        if (mm) mm.scrollTop = mm.scrollHeight;
+        ui.chatBottom = false;
+      }
     };
     rafId = requestAnimationFrame(run) || -1;
     rafT = setTimeout(run, 120);   // rAF never fires in a backgrounded tab
@@ -2254,7 +2342,7 @@ window.TROVE_CONFIG = {
 
     if (d.tab) {
       setUI({ tab: d.tab, detail: null, sheet: null });
-      if (d.tab === 'chat') { markSeen(); $('main').scrollTop = $('main').scrollHeight; }
+      if (d.tab === 'chat') markSeen();   // setUI already pinned the log to the newest message
       return;
     }
     if (d.open) return setUI({ detail: d.open, sheet: null });
@@ -2480,12 +2568,15 @@ window.TROVE_CONFIG = {
       const box = $('msgBox');
       const text = ((box && box.value) || '').trim();
       if (!text && !ui.attachItem) return;
+      // Clear the field before anything repaints, so the sent text can never come back.
+      if (box) box.value = '';
+      painted.msgBox = '';
+      const attach = ui.attachItem;
+      ui.attachItem = null; ui.draft = ''; ui.chatBottom = true;
       S.update((s) => {
-        s.messages = (s.messages || []).concat([{ id: uid(), by: meName(), text, itemId: ui.attachItem || null, t: Date.now() }]).slice(-300);
+        s.messages = (s.messages || []).concat([{ id: uid(), by: meName(), text, itemId: attach || null, t: Date.now() }]).slice(-300);
       });
-      ui.attachItem = null; ui.draft = '';
       markSeen(); render();
-      $('main').scrollTop = $('main').scrollHeight;
       return;
     }
     if (d.pickattach) { ui.attachItem = d.pickattach; return setUI({ sheet: null, tab: 'chat' }); }
@@ -2552,10 +2643,17 @@ window.TROVE_CONFIG = {
       return;
     }
     if (e.target.id === 'msgBox') { ui.draft = e.target.value; return; }
-    if (e.target.id === 'meName') { setMe(e.target.value.trim() || 'Me'); return; }
+  });
+
+  // Tapping your own name should let you type over it, not force a backspace marathon.
+  document.addEventListener('focusin', (e) => {
+    if (e.target && (e.target.id === 'meName' || e.target.id === 'houseName')) {
+      setTimeout(() => { try { e.target.select(); } catch (err) {} }, 0);
+    }
   });
 
   document.addEventListener('change', (e) => {
+    if (e.target.id === 'meName') { setMe(e.target.value.trim() || 'Me'); return; }   // saved on blur, not per keystroke
     const photoId = e.target.dataset.photo;
     if (photoId && e.target.files && e.target.files[0]) {
       readPhoto(e.target.files[0], (dataUrl) => {

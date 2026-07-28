@@ -818,10 +818,7 @@ window.TROVE_CONFIG = {
   const $ = (id) => document.getElementById(id);
   const st = () => S.state;
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  const money = (n) => '
-</body>
-</html>
- + Math.round(n || 0).toLocaleString();
+  const money = (n) => '$' + Math.round(n || 0).toLocaleString();
   const uid = () => 'x' + Math.random().toString(36).slice(2, 9);
   const ago = (t) => {
     const m = Math.round((Date.now() - (t || 0)) / 60000);

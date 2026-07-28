@@ -483,6 +483,110 @@ window.TROVE_CONFIG = {
       .subscribe();
   }
 
+  // ---------- Keyless market data (works today, no API keys) ----------
+  // PriceCharting publishes loose / CIB / new medians for retro and current games
+  // and hardware. We read it through a public CORS proxy.
+  const PROXIES = [
+    (u) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
+    (u) => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(u),
+    (u) => 'https://corsproxy.io/?url=' + encodeURIComponent(u),
+    (u) => 'https://api.cors.lol/?url=' + encodeURIComponent(u),
+    (u) => 'https://proxy.cors.sh/' + u,
+  ];
+
+  // Lookups are cached for six hours so a public proxy never gets hammered.
+  const MKT_KEY = 'trove.market.v1';
+  const mktCache = (() => { try { return JSON.parse(localStorage.getItem(MKT_KEY) || '{}'); } catch (e) { return {}; } })();
+  const cacheGet = (k) => {
+    const hit = mktCache[k];
+    return hit && Date.now() - hit.t < 6 * 3600e3 ? hit.v : null;
+  };
+  const cachePut = (k, v) => {
+    mktCache[k] = { t: Date.now(), v };
+    const keys = Object.keys(mktCache);
+    if (keys.length > 400) delete mktCache[keys[0]];
+    try { localStorage.setItem(MKT_KEY, JSON.stringify(mktCache)); } catch (e) {}
+  };
+
+  async function viaProxy(url, ms) {
+    let lastErr;
+    for (let pass = 0; pass < 2; pass++) {
+      for (const wrap of PROXIES) {
+        try {
+          const res = await fetch(wrap(url), { signal: AbortSignal.timeout(ms || 12000) });
+          if (!res.ok) { lastErr = new Error('proxy ' + res.status); continue; }
+          const text = await res.text();
+          if (text.length > 2000) return text;
+          lastErr = new Error('empty response');
+        } catch (e) { lastErr = e; }
+      }
+      if (pass === 0) await new Promise((r) => setTimeout(r, 1200));
+    }
+    throw new Error('Could not reach the price source just now — try again in a moment');
+  }
+
+  const num = (s2) => parseFloat(String(s2).replace(/[^0-9.]/g, '')) || 0;
+
+  function parsePC(html) {
+    const rows = [];
+    const body = html.slice(html.indexOf('games_table'));
+    const chunks = body.split('<tr id="product-').slice(1);
+    for (const c of chunks.slice(0, 12)) {
+      const img = (c.match(/src="(https:\/\/storage\.googleapis\.com\/images\.pricecharting\.com\/[^"]+)"/) || [])[1] || null;
+      const link = (c.match(/href="(https:\/\/www\.pricecharting\.com\/game\/[^"]+)"/) || [])[1] || null;
+      const titleBlock = c.slice(c.indexOf('<td class="title"'));
+      const title = ((titleBlock.match(/>\s*([^<>]{2,120}?)\s*<\/a>/) || [])[1] || '').trim();
+      const console_ = ((titleBlock.match(/console-in-title[\s\S]{0,180}?>\s*([^<>]{2,60}?)\s*<\/a>/) || [])[1] || '').trim();
+      const prices = (c.match(/js-price">\s*\$?([0-9,]+\.[0-9]{2})/g) || []).map(num);
+      if (!title || !prices.length) continue;
+      rows.push({
+        title, console: console_, url: link, image: img ? img.replace(/\/60\.jpg$/, '/240.jpg') : null,
+        loose: prices[0] || 0, cib: prices[1] || 0, sealed: prices[2] || 0,
+      });
+    }
+    return rows;
+  }
+
+  const tokens = (s2) => String(s2).toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter((w) => w.length > 1);
+
+  // Rank candidates against what the user actually typed, so "Nintendo 64"
+  // returns the console and not the best-selling game on it.
+  function pickRow(rows, region, query, kind) {
+    if (!rows.length) return null;
+    const want = tokens(query);
+    const jp = (r) => /\bJP\b|Japan/i.test(r.console || '');
+    const pal = (r) => /\bPAL\b/i.test(r.console || '');
+    const hardware = kind && kind !== 'game';
+    const scored = rows.map((r) => {
+      const have = tokens(r.title + ' ' + r.console);
+      let sc = want.filter((w) => have.includes(w)).length * 3;
+      if (tokens(r.title).join(' ') === want.join(' ')) sc += 6;
+      if (hardware && /system|console|handheld/i.test(r.title)) sc += 5;
+      if (!hardware && /system|console/i.test(r.title)) sc -= 3;
+      if (region === 'jp') { if (jp(r)) sc += 6; else sc -= 4; }
+      else { if (jp(r) || pal(r)) sc -= 5; }
+      return { r, sc };
+    }).sort((a, b) => b.sc - a.sc);
+    return scored[0].r;
+  }
+
+  async function marketLookup(query, region, kind) {
+    const key = (region || 'en') + '|' + (kind || '') + '|' + query.toLowerCase().trim();
+    const hit = cacheGet(key);
+    if (hit) return hit;
+    let q = query;
+    if (region === 'jp' && !/jp|japan/i.test(q)) q += ' JP';
+    if (kind && kind !== 'game' && kind !== 'accessory' && !/system|console/i.test(q)) q += ' system';
+    const url = 'https://www.pricecharting.com/search-products?q=' + encodeURIComponent(q) + '&type=prices';
+    const html = await viaProxy(url);
+    const rows = parsePC(html);
+    const row = pickRow(rows, region, query, kind);
+    if (!row) throw new Error('No market data found for “' + query + '” — try the exact title');
+    const out = { row, rows };
+    cachePut(key, out);
+    return out;
+  }
+
   // ---------- Public API ----------
   const Store = {
     get state() { return state; },
@@ -521,18 +625,53 @@ window.TROVE_CONFIG = {
       subscribe();
     },
 
-    // Live prices via the optional edge function.
+    marketLookup,
+
+    // Live market data. PriceCharting always; eBay asking prices too, once deployed.
     async refreshPrice(item) {
-      if (!CFG.PRICES_ENDPOINT) throw new Error('Live prices are not configured yet — see README.');
+      let market = null;
+      try { market = await marketLookup(item.name, item.region, item.kind); }
+      catch (e) { if (!CFG.PRICES_ENDPOINT) throw e; }
+      if (market) {
+        const r = market.row;
+        Store.update((s2) => {
+          const it = s2.items.find((i) => i.id === item.id);
+          if (!it) return;
+          it.tiers = { loose: r.loose, cib: r.cib, sealed: r.sealed };
+          const pick = it.cond === 'sealed' ? (r.sealed || r.cib || r.loose)
+            : it.cond === 'new' ? (it.era === 'current' ? (r.cib || r.loose) : (r.sealed || r.cib || r.loose))
+            : it.cond === 'cib' ? (r.cib || r.loose) : (r.loose || r.cib);
+          if (pick) it.sell = Math.round(pick);
+          if (r.image && !it.image) it.autoImage = r.image;
+          if (r.console) it.pcConsole = r.console;
+          it.pcUrl = r.url;
+          it.marketSource = 'PriceCharting';
+          it.refreshedAt = Date.now();
+          it.history = (it.history || []).concat([{ t: Date.now(), buy: it.buy, sell: it.sell }]).slice(-60);
+        });
+      }
+      if (!CFG.PRICES_ENDPOINT) return { market: market && market.row };
       let res;
       try {
         res = await fetch(CFG.PRICES_ENDPOINT, {
+          signal: AbortSignal.timeout(12000),
           method: 'POST',
           headers: { 'content-type': 'application/json', ...(CFG.SUPABASE_ANON_KEY ? { authorization: 'Bearer ' + CFG.SUPABASE_ANON_KEY } : {}) },
           body: JSON.stringify({ query: item.name, condition: item.cond }),
         });
-      } catch (e) { Store.priceError = 'Price service unreachable'; emit(); throw new Error(Store.priceError); }
-      if (!res.ok) { Store.priceError = 'Price service returned ' + res.status; emit(); throw new Error(Store.priceError); }
+      } catch (e) {
+        Store.priceError = 'Price service unreachable';
+        emit();
+        // Market values already landed — a missing eBay leg is not a failure.
+        if (market) return { market: market.row, askUnavailable: true };
+        throw new Error(Store.priceError);
+      }
+      if (!res.ok) {
+        Store.priceError = 'Price service returned ' + res.status;
+        emit();
+        if (market) return { market: market.row, askUnavailable: true };
+        throw new Error(Store.priceError);
+      }
       const out = await res.json(); // { lowestBuy, soldMedian, listings: [...] }
       Store.priceError = null;
       Store.update((s) => {
@@ -591,34 +730,59 @@ window.TROVE_CONFIG = {
     },
 
     // Price anything by name without adding it to the catalog.
-    async quickLook(query, condition) {
-      if (!CFG.PRICES_ENDPOINT) throw new Error('Live prices are not switched on yet — see README.');
-      const res = await fetch(CFG.PRICES_ENDPOINT, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', ...(CFG.SUPABASE_ANON_KEY ? { authorization: 'Bearer ' + CFG.SUPABASE_ANON_KEY } : {}) },
-        body: JSON.stringify({ query, condition: condition || 'used' }),
-      });
-      const out = await res.json();
-      if (!res.ok || out.error) { Store.priceError = out.error || ('Price service returned ' + res.status); emit(); throw new Error(Store.priceError); }
+    async quickLook(query, condition, region, kind) {
+      const m = await marketLookup(query, region, kind);   // real market data, no keys needed
+      if (!CFG.PRICES_ENDPOINT) {
+        const r = m.row;
+        return { query, market: r, tiers: { loose: r.loose, cib: r.cib, sealed: r.sealed },
+          soldMedian: condition === 'sealed' || condition === 'new' ? (r.sealed || r.cib || r.loose)
+            : condition === 'cib' ? (r.cib || r.loose) : (r.loose || r.cib),
+          image: r.image, pcUrl: r.url, listings: [], askUnknown: true };
+      }
+      const marketOnly = () => {
+        const r = m.row;
+        return { query, market: r, tiers: { loose: r.loose, cib: r.cib, sealed: r.sealed },
+          soldMedian: condition === 'sealed' ? (r.sealed || r.cib || r.loose)
+            : condition === 'cib' ? (r.cib || r.loose) : (r.loose || r.cib),
+          image: r.image, pcUrl: r.url, listings: [], askUnknown: true };
+      };
+      let res;
+      try {
+        res = await fetch(CFG.PRICES_ENDPOINT, {
+          method: 'POST',
+          signal: AbortSignal.timeout(12000),
+          headers: { 'content-type': 'application/json', ...(CFG.SUPABASE_ANON_KEY ? { authorization: 'Bearer ' + CFG.SUPABASE_ANON_KEY } : {}) },
+          body: JSON.stringify({ query, condition: condition || 'used' }),
+        });
+      } catch (e) { Store.priceError = 'eBay service unreachable'; return marketOnly(); }
+      let out;
+      try { out = await res.json(); } catch (e) { return marketOnly(); }
+      if (!res.ok || out.error) { Store.priceError = out.error || ('Price service returned ' + res.status); emit(); return marketOnly(); }
       Store.priceError = null;
+      out.market = m.row;
+      out.tiers = { loose: m.row.loose, cib: m.row.cib, sealed: m.row.sealed };
+      if (!out.image) out.image = m.row.image;
       return out;
     },
 
     // Quietly re-check anything whose price is older than REFRESH_HOURS.
     async refreshStale(force, onProgress) {
-      if (!CFG.PRICES_ENDPOINT) throw new Error('Live prices are not switched on yet — see README.');
       const maxAge = (CFG.REFRESH_HOURS || 12) * 3600e3;
-      const due = state.items.filter((i) => force || !i.refreshedAt || Date.now() - i.refreshedAt > maxAge);
+      const all = state.items.filter((i) => force || !i.refreshedAt || Date.now() - i.refreshedAt > maxAge);
+      const due = force ? all : all.slice(0, 8);
       let done = 0;
       for (let k = 0; k < due.length; k += 2) {
         await Promise.all(due.slice(k, k + 2).map((it) => Store.refreshPrice(it).catch(() => {})));
         done = Math.min(k + 2, due.length);
         if (onProgress) onProgress(done, due.length);
+        await new Promise((r) => setTimeout(r, 400));
       }
       return done;
     },
 
-    get pricesOn() { return !!CFG.PRICES_ENDPOINT; },
+    get pricesOn() { return !!CFG.PRICES_ENDPOINT; },   // eBay asking prices / exact listings
+    get marketOn() { return true; },                    // PriceCharting market values (keyless)
+    removeItem(id) { Store.update((s2) => { s2.items = s2.items.filter((i) => i.id !== id); delete s2.watch[id]; }); },
     priceError: null,
 
     initCloud,
@@ -641,6 +805,7 @@ window.TROVE_CONFIG = {
   const uid = () => 'x' + Math.random().toString(36).slice(2, 9);
   const src = (k) => D.SOURCES.find((s) => s.key === k) || D.SOURCES[0];
   const platOf = (it) => D.PLATFORMS[it.platform] || D.PLATFORMS.multi;
+  const regionOf = (it) => (it.region === 'jp' ? 'Japan' : it.region === 'pal' ? 'PAL' : 'US / EN');
   const condLabel = (k) => (D.CONDS.find((c) => c.key === k) || { label: 'Used' }).label;
 
   const ICON = {
@@ -669,7 +834,7 @@ window.TROVE_CONFIG = {
   const lastSeen = () => parseInt(localStorage.getItem(SEEN_KEY) || '0', 10);
   const markSeen = () => localStorage.setItem(SEEN_KEY, String(Date.now()));
 
-  let ui = { tab: 'browse', q: '', plat: 'all', kind: 'all', era: 'all', sort: 'steal', detail: null, sheet: null, attachItem: null, draft: '', authEmail: '' };
+  let ui = { tab: 'browse', q: '', plat: 'all', kind: 'all', era: 'all', region: 'all', sort: 'steal', detail: null, sheet: null, attachItem: null, draft: '', authEmail: '' };
   let toastT = null;
 
   function setUI(patch) { Object.assign(ui, patch); render(); }
@@ -712,6 +877,12 @@ window.TROVE_CONFIG = {
     const t = trend(it);
     return ((t[11] - t[0]) / t[0]) * 100;
   }
+  function targetMargin() { return st().settings.targetMargin || 30; }
+  function maxBuy(it) {
+    const m = mv(it);
+    return Math.max(0, Math.round(fees(m) - ship(it) - (m * targetMargin()) / 100));
+  }
+
   function sellPlan(it) {
     const m = mv(it);
     const list = Math.round(m * 1.06);          // list a touch over median, expect offers
@@ -794,6 +965,7 @@ window.TROVE_CONFIG = {
     if (ui.plat !== 'all') list = list.filter((i) => i.platform === ui.plat);
     if (ui.kind !== 'all') list = list.filter((i) => i.kind === ui.kind);
     if (ui.era !== 'all') list = list.filter((i) => i.era === ui.era);
+    if (ui.region !== 'all') list = list.filter((i) => (i.region || 'en') === ui.region);
     const by = {
       steal: (a, b) => gap(b) - gap(a),
       cheap: (a, b) => a.buy - b.buy,
@@ -834,13 +1006,10 @@ window.TROVE_CONFIG = {
     const steals = list.filter((i) => deal(i) >= 0.38).length;
     const sorts = [['steal', 'Steals'], ['cheap', 'Cheapest'], ['value', 'Top value'], ['az', 'A–Z']];
     return `<div class="screen">
-      ${S.pricesOn && !S.priceError ? `<button class="row" data-refreshall="1" style="margin:4px 0 10px;min-height:0;padding:9px 13px;background:var(--sage-100);box-shadow:none">
+      <button class="row" data-refreshall="1" style="margin:4px 0 10px;min-height:0;padding:9px 13px;background:var(--sage-100);box-shadow:none">
         <span style="color:var(--sage-700);display:grid;place-items:center">${svg(ICON.refresh, 17)}</span>
-        <span style="flex:1;font-size:12px;font-weight:700;color:var(--sage-800)">Live eBay prices are on — tap to re-check everything</span>
-      </button>` : `<div class="row" style="margin:4px 0 10px;min-height:0;padding:9px 13px;background:var(--accent-100);box-shadow:none;cursor:default">
-        <span style="color:var(--accent-700);display:grid;place-items:center">${svg(ICON.chart, 17)}</span>
-        <span style="flex:1;font-size:12px;font-weight:700;color:var(--accent-800)">${S.priceError ? 'Price service not answering yet — deploy it (README) for exact listings' : 'Live prices off — add the price service (README) for exact listings'}</span>
-      </div>`}
+        <span style="flex:1;font-size:12px;font-weight:700;color:var(--sage-800)">Live market values on${S.pricesOn && !S.priceError ? ' + eBay listings' : ''} — tap to re-check everything</span>
+      </button>
       <div class="search" style="margin:4px 0 12px">
         ${svg(ICON.search, 18)}
         <input id="searchBox" placeholder="Search consoles, handhelds, games…" value="${esc(ui.q)}" autocomplete="off">
@@ -851,6 +1020,10 @@ window.TROVE_CONFIG = {
         <button class="chip" data-era="all" aria-pressed="${ui.era === 'all'}">All eras</button>
         <button class="chip" data-era="retro" aria-pressed="${ui.era === 'retro'}">Retro</button>
         <button class="chip" data-era="current" aria-pressed="${ui.era === 'current'}">Current</button>
+        <span style="width:1px;background:var(--divider);flex:none;margin:4px 3px"></span>
+        <button class="chip" data-region="all" aria-pressed="${ui.region === 'all'}">Any region</button>
+        <button class="chip" data-region="en" aria-pressed="${ui.region === 'en'}">US / EN</button>
+        <button class="chip" data-region="jp" aria-pressed="${ui.region === 'jp'}">Japanese</button>
         <span style="width:1px;background:var(--divider);flex:none;margin:4px 3px"></span>
         <button class="chip" data-plat="all" aria-pressed="${ui.plat === 'all'}">All platforms</button>
         ${platformsInUse().map((p) => `<button class="chip" data-plat="${p}" aria-pressed="${ui.plat === p}">${esc((D.PLATFORMS[p] || ['?'])[0])}</button>`).join('')}
@@ -1078,6 +1251,13 @@ window.TROVE_CONFIG = {
           <button class="switch" data-togglefees="1" role="switch" aria-checked="${!!s.settings.fees}"><i></i></button>
         </div>
         <div style="border-top:1px solid var(--divider);margin-top:12px;padding-top:12px">
+          <label class="f">Margin you want on a flip</label>
+          <div class="seg">
+            ${[20, 30, 40, 50].map((v) => `<button data-margin="${v}" aria-pressed="${(s.settings.targetMargin || 30) === v}">${v}%</button>`).join('')}
+          </div>
+          <div class="muted" style="font-size:10.5px;margin-top:6px">Drives the “pay no more than” number on every item.</div>
+        </div>
+        <div style="border-top:1px solid var(--divider);margin-top:12px;padding-top:12px">
           <label class="f">Where you usually buy</label>
           <select class="in" id="venue">
             ${D.SOURCES.map((v) => `<option value="${v.key}" ${s.settings.venue === v.key ? 'selected' : ''}>${esc(v.name)}</option>`).join('')}
@@ -1120,6 +1300,7 @@ window.TROVE_CONFIG = {
             <span class="tag tag-plat" style="background:${pbg};color:${pfg}">${esc(plabel)}</span>
             <span class="tag">${esc(condLabel(it.cond))}</span>
             <span class="tag ${it.era === 'retro' ? 'tag-sage' : 'tag-accent'}">${it.era === 'retro' ? 'Retro' : 'Current'}</span>
+            <span class="tag">${esc(regionOf(it))}</span>
           </div>
         </div>
       </div>
@@ -1139,6 +1320,18 @@ window.TROVE_CONFIG = {
           </div>
         </div>
         <div style="margin-top:14px;position:relative">${eq(trend(it), true)}</div>
+        ${it.tiers ? `<div style="display:flex;gap:8px;margin-top:13px;position:relative">
+          <div class="stat"><b>${money(it.tiers.loose)}</b><span>Loose</span></div>
+          <div class="stat"><b>${money(it.tiers.cib)}</b><span>CIB</span></div>
+          <div class="stat"><b>${money(it.tiers.sealed)}</b><span>Sealed</span></div>
+        </div>` : ''}
+        <div style="display:flex;align-items:center;gap:10px;margin-top:13px;position:relative;background:rgba(255,255,255,.1);border-radius:16px;padding:11px 13px">
+          <div style="flex:1">
+            <div class="kicker">Pay no more than</div>
+            <div class="disp" style="font-size:24px;margin-top:3px">${money(maxBuy(it))}</div>
+          </div>
+          <div style="text-align:right;font-size:10.5px;color:var(--accent-300);max-width:44%">to clear ${targetMargin()}% after fees and ${money(ship(it))} shipping</div>
+        </div>
         <div style="display:flex;gap:8px;margin-top:12px;position:relative">
           <div class="stat"><b>${money(Math.min(...cs.map((c) => c.price)))}–${money(Math.max(...cs.map((c) => c.price)))}</b><span>Sold range</span></div>
           <div class="stat"><b style="color:${n.net >= 0 ? 'var(--sage-300)' : 'var(--accent-300)'}">${money(n.net)}</b><span>Net if flipped</span></div>
@@ -1241,7 +1434,11 @@ window.TROVE_CONFIG = {
         <button class="icon-btn" data-refresh="${it.id}" aria-label="Refresh price">${svg(ICON.refresh, 18)}</button>
         <button class="icon-btn" data-tochat="${it.id}" aria-label="Send to chat">${svg(ICON.send, 18)}</button>
       </div>
-      <p class="muted" style="font-size:10.5px">${it.refreshedAt ? 'Prices refreshed ' + new Date(it.refreshedAt).toLocaleString() : 'Starter price — refresh for live numbers.'}</p>
+      <div style="display:flex;align-items:center;gap:10px;margin-top:6px">
+        <p class="muted" style="font-size:10.5px;flex:1;margin:0">${it.refreshedAt ? (it.marketSource || 'Live') + ' · updated ' + new Date(it.refreshedAt).toLocaleString() : 'Starter number — tap refresh for live market data.'}</p>
+        ${it.pcUrl ? `<a href="${esc(it.pcUrl)}" target="_blank" rel="noopener" style="font-size:10.5px;font-weight:700">Price history ${svg(ICON.out, 11)}</a>` : ''}
+      </div>
+      <button class="btn btn-ghost btn-block" data-remove="${it.id}" style="margin-top:14px;color:var(--accent-700)">Stop tracking this item</button>
     `, [
       `<a class="btn btn-primary" href="${buyUrl(it)}" target="_blank" rel="noopener" style="flex:1">${esc(buyLabel(it))}</a>`,
       `<button class="btn btn-secondary" data-sheet="flip" data-flipitem="${it.id}">Log flip</button>`,
@@ -1265,9 +1462,12 @@ window.TROVE_CONFIG = {
       <p class="muted" style="font-size:12.5px">Name it the way you'd search for it — that's what the buy links use.</p>
       <div style="margin-top:10px"><label class="f">Name</label><input class="in" id="addName" value="${esc(ui.q)}" placeholder="Pokemon Silver Game Boy Color"></div>
       <div style="display:flex;gap:9px;margin-top:10px">
-        <div style="flex:1"><label class="f">Asking price</label><input class="in" id="addBuy" inputmode="numeric" placeholder="120"></div>
-        <div style="flex:1"><label class="f">Market value</label><input class="in" id="addSell" inputmode="numeric" placeholder="180"></div>
+        <div style="flex:1"><label class="f">Region</label><select class="in" id="addRegion">
+          <option value="en">US / English</option><option value="jp">Japanese</option><option value="pal">PAL</option>
+        </select></div>
+        <div style="flex:1"><label class="f">Asking price seen <span class="muted">(optional)</span></label><input class="in" id="addBuy" inputmode="numeric" placeholder="120"></div>
       </div>
+      <p class="muted" style="font-size:11.5px;margin-top:10px">Market value, condition tiers and the photo are fetched for you when you add it.</p>
       <div style="display:flex;gap:9px;margin-top:10px">
         <div style="flex:1"><label class="f">Type</label><select class="in" id="addKind">
           ${D.KINDS.filter((k) => k.key !== 'all').map((k) => `<option value="${k.key}">${esc(k.label)}</option>`).join('')}
@@ -1278,7 +1478,7 @@ window.TROVE_CONFIG = {
       </div>
       <div style="display:flex;gap:9px;margin-top:10px">
         <div style="flex:1"><label class="f">Condition</label><select class="in" id="addCond">
-          ${D.CONDS.map((c) => `<option value="${c.key}">${esc(c.label)}</option>`).join('')}
+          ${D.CONDS.map((c) => `<option value="${c.key}" ${c.key === 'used' ? 'selected' : ''}>${esc(c.label)}</option>`).join('')}
         </select></div>
         <div style="flex:1"><label class="f">Era</label><select class="in" id="addEra">
           <option value="retro">Retro</option><option value="current">Current</option>
@@ -1327,19 +1527,49 @@ window.TROVE_CONFIG = {
         <input class="in" id="quickBox" placeholder="Pokemon Silver Game Boy Color" value="${esc(ui.quickQ || '')}" style="flex:1">
         <button class="btn btn-primary" data-lookup="1">Check</button>
       </div>
-      ${r ? `<div class="cab" style="margin-top:14px">
+      <div style="display:flex;gap:9px;margin-top:9px">
+        <select class="in" id="quickKind" style="flex:1">
+          <option value="game">Game</option><option value="console">Console</option>
+          <option value="handheld">Handheld</option><option value="accessory">Accessory</option>
+        </select>
+        <select class="in" id="quickCond" style="flex:1">
+          <option value="loose">Loose / cart only</option><option value="used" selected>Used</option>
+          <option value="cib">Complete in box</option><option value="sealed">Sealed</option>
+        </select>
+        <select class="in" id="quickRegion" style="flex:1">
+          <option value="en">US / English</option><option value="jp">Japanese</option>
+        </select>
+      </div>
+      ${r ? (() => {
+        const fake = { id: 'quick', name: (r.market && r.market.title) || r.query, kind: 'game', cond: ui.quickCond || 'used', sell: r.soldMedian || 0 };
+        const mx = maxBuy(fake);
+        return `<div class="cab" style="margin-top:14px">
         <span class="scan"></span><span class="glow"></span>
         <div style="position:relative">
-          <div class="kicker">${esc(r.query)}</div>
-          <div style="display:flex;align-items:flex-end;gap:16px;margin-top:8px">
-            <div><div class="kicker">Cheapest</div><div class="disp" style="font-size:26px">${money(r.lowestBuy)}</div></div>
-            <div><div class="kicker">Market</div><div class="disp" style="font-size:26px;color:var(--accent-300)">${money(r.soldMedian)}</div></div>
-            <div style="margin-left:auto;text-align:right"><div class="disp" style="font-size:22px;color:var(--sage-300)">${money(Math.max(0, fees(r.soldMedian) - r.lowestBuy))}</div><div class="kicker">net flip</div></div>
+          <div style="display:flex;align-items:center;gap:12px">
+            ${r.image ? `<div class="art" style="width:56px;height:56px;background:#fff"><img src="${esc(r.image)}" alt="" style="object-fit:contain;padding:3px"></div>` : ''}
+            <div style="min-width:0">
+              <div class="disp" style="font-size:17px">${esc((r.market && r.market.title) || r.query)}</div>
+              <div class="kicker" style="margin-top:4px">${esc((r.market && r.market.console) || '')}</div>
+            </div>
           </div>
-          ${(r.listings || []).length ? `<a class="btn" href="${esc(r.listings[0].url)}" target="_blank" rel="noopener" style="margin-top:14px;width:100%;background:var(--accent-300);color:var(--accent-900)">Open the cheapest listing</a>` : ''}
+          <div style="display:flex;align-items:flex-end;gap:16px;margin-top:14px">
+            <div><div class="kicker">Market now</div><div class="disp" style="font-size:28px">${money(r.soldMedian)}</div></div>
+            <div style="margin-left:auto;text-align:right"><div class="kicker">Pay no more than</div><div class="disp" style="font-size:24px;color:var(--sage-300)">${money(mx)}</div></div>
+          </div>
+          ${r.tiers ? `<div style="display:flex;gap:8px;margin-top:13px">
+            <div class="stat"><b>${money(r.tiers.loose)}</b><span>Loose</span></div>
+            <div class="stat"><b>${money(r.tiers.cib)}</b><span>CIB</span></div>
+            <div class="stat"><b>${money(r.tiers.sealed)}</b><span>Sealed</span></div>
+          </div>` : ''}
+          ${(r.listings || []).length ? `<a class="btn" href="${esc(r.listings[0].url)}" target="_blank" rel="noopener" style="margin-top:13px;width:100%;background:var(--accent-300);color:var(--accent-900)">Open the cheapest listing ${money(r.lowestBuy)}</a>`
+            : `<a class="btn" href="${src('ebay').url((r.market && r.market.title) || r.query)}" target="_blank" rel="noopener" style="margin-top:13px;width:100%;background:var(--accent-300);color:var(--accent-900)">Find one on eBay</a>`}
         </div>
       </div>
-      <button class="btn btn-secondary btn-block" data-quickadd="1" style="margin-top:10px">Track this</button>`
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <button class="btn btn-sage" data-quickadd="1" style="flex:1">Track this</button>
+        <a class="btn btn-secondary" href="${D.soldComps((r.market && r.market.title) || r.query)}" target="_blank" rel="noopener">Sold comps</a>
+      </div>`; })()
       : `<div style="margin-top:14px;display:flex;gap:8px">
           <a class="btn btn-secondary" href="${D.soldComps(ui.quickQ || 'retro game')}" target="_blank" rel="noopener" style="flex:1;font-size:12.5px">Sold comps ${svg(ICON.out, 13)}</a>
           <a class="btn btn-secondary" href="${D.priceCharting(ui.quickQ || 'retro game')}" target="_blank" rel="noopener" style="flex:1;font-size:12.5px">PriceCharting ${svg(ICON.out, 13)}</a>
@@ -1366,7 +1596,29 @@ window.TROVE_CONFIG = {
   }
 
   // ---------- render ----------
+  let rafId = null, rafT = null;
   function render() {
+    if (rafId) return;
+    const run = () => {
+      if (!rafId) return;
+      clearTimeout(rafT);
+      cancelAnimationFrame(rafId);
+      rafId = null;
+      const m = $('main');
+      const sc = m ? m.scrollTop : 0;
+      const sb = document.querySelector('.sheet-body');
+      const ssc = sb ? sb.scrollTop : 0;
+      paintGuarded();
+      const m2 = $('main');
+      if (m2 && sc) m2.scrollTop = sc;
+      const sb2 = document.querySelector('.sheet-body');
+      if (sb2 && ssc) sb2.scrollTop = ssc;
+    };
+    rafId = requestAnimationFrame(run) || -1;
+    rafT = setTimeout(run, 120);   // rAF never fires in a backgrounded tab
+  }
+
+  function paintGuarded() {
     try { paint(); }
     catch (err) {
       console.error(err);
@@ -1465,7 +1717,7 @@ window.TROVE_CONFIG = {
 
   // ---------- events ----------
   document.addEventListener('click', async (e) => {
-    const el = e.target.closest('[data-tab],[data-open],[data-close],[data-backdrop],[data-sheet],[data-sort],[data-kind],[data-plat],[data-era],[data-clearq],[data-watch],[data-unwatch],[data-refresh],[data-add],[data-logflip],[data-delflip],[data-togglefees],[data-signout],[data-sendlink],[data-verify],[data-join],[data-repair],[data-reset],[data-send],[data-unattach],[data-pickattach],[data-clearphoto],[data-tochat],[data-refreshall],[data-lookup],[data-quickadd],[data-copytitle],[data-arturl]');
+    const el = e.target.closest('[data-tab],[data-open],[data-close],[data-backdrop],[data-sheet],[data-sort],[data-kind],[data-plat],[data-era],[data-clearq],[data-watch],[data-unwatch],[data-refresh],[data-add],[data-logflip],[data-delflip],[data-togglefees],[data-signout],[data-sendlink],[data-verify],[data-join],[data-repair],[data-reset],[data-send],[data-unattach],[data-pickattach],[data-clearphoto],[data-tochat],[data-refreshall],[data-lookup],[data-quickadd],[data-copytitle],[data-arturl],[data-remove],[data-region],[data-margin]');
     if (!el) return;
     const d = el.dataset;
     if (el.tagName === 'A') return;
@@ -1485,6 +1737,8 @@ window.TROVE_CONFIG = {
     if (d.kind) return setUI({ kind: d.kind });
     if (d.plat) return setUI({ plat: d.plat });
     if (d.era) return setUI({ era: d.era });
+    if (d.region) return setUI({ region: d.region });
+    if (d.margin) { S.update((s) => { s.settings.targetMargin = parseInt(d.margin, 10); }); return; }
     if (d.clearq) { ui.q = ''; return setUI({ qFocus: true }); }
 
     if (d.watch) {
@@ -1516,21 +1770,32 @@ window.TROVE_CONFIG = {
     if (d.lookup) {
       const q = ($('quickBox').value || '').trim();
       if (!q) return toast('Type what you are looking at');
-      ui.quickQ = q; toast('Checking eBay…');
-      try { ui.quick = await S.quickLook(q); render(); }
+      ui.quickQ = q; toast('Checking the market…');
+      try {
+        ui.quickCond = ($('quickCond') || {}).value || 'used';
+        ui.quickRegion = ($('quickRegion') || {}).value || 'en';
+        ui.quickKind = ($('quickKind') || {}).value || 'game';
+        ui.quick = await S.quickLook(q, ui.quickCond, ui.quickRegion, ui.quickKind);
+        render();
+      }
       catch (err) { ui.quick = null; render(); toast(err.message); }
       return;
     }
     if (d.quickadd && ui.quick) {
-      const r = ui.quick;
+      const r = ui.quick, id = uid();
+      const sell = Math.round(r.soldMedian || 0);
       S.update((s) => {
-        s.items.unshift({ id: uid(), name: r.query, kind: 'game', platform: 'multi', era: 'current', cond: 'used',
-          buy: Math.round(r.lowestBuy), sell: Math.round(r.soldMedian), listings: r.listings || [],
-          bestUrl: (r.listings || [])[0] && r.listings[0].url, bestPrice: Math.round(r.lowestBuy),
-          image: null, refreshedAt: Date.now(), history: [{ t: Date.now(), buy: r.lowestBuy, sell: r.soldMedian }] });
+        s.items.unshift({ id, name: (r.market && r.market.title) || r.query, kind: ui.quickKind || 'game', platform: 'multi',
+          era: 'retro', cond: ui.quickCond || 'used', region: ui.quickRegion || 'en',
+          buy: Math.round(r.lowestBuy || 0), sell, tiers: r.tiers || null,
+          autoImage: r.image || null, pcUrl: r.pcUrl || null, marketSource: 'PriceCharting',
+          listings: r.listings || [], bestUrl: (r.listings || [])[0] && r.listings[0].url,
+          refreshedAt: Date.now(), history: [{ t: Date.now(), buy: r.lowestBuy || 0, sell }] });
       });
-      toast('Tracking ' + r.query);
-      return setUI({ sheet: null, quick: null });
+      const it = st().items.find((i) => i.id === id);
+      if (!it.buy) S.update((s) => { const x = s.items.find((i) => i.id === id); if (x) x.buy = maxBuy(x); });
+      toast('Tracking it');
+      return setUI({ sheet: null, quick: null, detail: id });
     }
     if (d.copytitle) {
       const it = st().items.find((i) => i.id === d.copytitle);
@@ -1554,16 +1819,30 @@ window.TROVE_CONFIG = {
       const name = ($('addName').value || '').trim();
       if (!name) return toast('Give it a name');
       const buy = parseFloat($('addBuy').value) || 0;
-      const sell = parseFloat($('addSell').value) || buy;
+      const id = uid();
       S.update((s) => {
         s.items.unshift({
-          id: uid(), name, kind: $('addKind').value, platform: $('addPlat').value,
-          era: $('addEra').value, cond: $('addCond').value, buy, sell,
-          history: [{ t: Date.now(), buy, sell }],
+          id, name, kind: $('addKind').value, platform: $('addPlat').value,
+          era: $('addEra').value, cond: $('addCond').value, region: $('addRegion').value,
+          buy, sell: 0, history: [],
         });
       });
-      toast('Tracking ' + name);
-      return setUI({ sheet: null, q: '' });
+      setUI({ sheet: null, q: '' });
+      toast('Looking up ' + name + '…');
+      try {
+        await S.refreshPrice(st().items.find((i) => i.id === id));
+        const it = st().items.find((i) => i.id === id);
+        if (!it.buy) S.update((s) => { const x = s.items.find((i) => i.id === id); if (x) x.buy = maxBuy(x); });
+        toast('Market value ' + money(mv(st().items.find((i) => i.id === id))));
+        setUI({ detail: id });
+      } catch (err) { toast('Added, but no market data: ' + err.message); }
+      return;
+    }
+    if (d.remove) {
+      const it = st().items.find((i) => i.id === d.remove);
+      if (!confirm('Stop tracking ' + (it ? it.name : 'this item') + '?')) return;
+      S.removeItem(d.remove);
+      return setUI({ detail: null });
     }
 
     if (d.logflip) {
@@ -1645,6 +1924,9 @@ window.TROVE_CONFIG = {
       return;
     }
     if (e.target.id === 'venue') { S.update((s) => { s.settings.venue = e.target.value; }); }
+    if (e.target.id === 'quickCond') { ui.quickCond = e.target.value; }
+    if (e.target.id === 'quickKind') { ui.quickKind = e.target.value; }
+    if (e.target.id === 'quickRegion') { ui.quickRegion = e.target.value; }
   });
 
   document.addEventListener('keydown', (e) => {
@@ -1661,7 +1943,7 @@ window.TROVE_CONFIG = {
 
   // Real product photos arrive on their own; live prices follow if configured.
   S.autoArt().catch(() => {});
-  if (S.pricesOn) setTimeout(() => S.refreshStale(false).catch(() => {}), 4000);
+  setTimeout(() => S.refreshStale(false).catch(() => {}), 3000);   // a few stale items per session
 })();
 
 </script>

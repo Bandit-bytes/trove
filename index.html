@@ -573,11 +573,32 @@ window.TROVE_CONFIG = {
     return scored[0].r;
   }
 
+  // A barcode means nothing to a price database — turn it into a product title first.
+  async function upcTitle(code) {
+    const url = 'https://api.upcitemdb.com/prod/trial/lookup?upc=' + encodeURIComponent(code);
+    const parse = (txt) => {
+      try {
+        const j = JSON.parse(txt);
+        const it = (j.items || [])[0];
+        return (it && (it.title || it.brand)) || null;
+      } catch (e) { return null; }
+    };
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(9000) });
+      if (res.ok) { const t = parse(await res.text()); if (t) return t; }
+    } catch (e) {}
+    try { return parse(await viaProxy(url, 9000)); } catch (e) { return null; }
+  }
+
   async function marketLookup(query, region, kind) {
     const key = (region || 'en') + '|' + (kind || '') + '|' + query.toLowerCase().trim();
     const hit = cacheGet(key);
     if (hit) return hit;
-    let q = query;
+    let q = query, resolved = null;
+    if (isUpc(q)) {
+      resolved = await upcTitle(q);
+      if (resolved) q = resolved.replace(/\(.*?\)/g, ' ').replace(/\s+/g, ' ').trim();
+    }
     if (!isUpc(q)) {
       if (region === 'jp' && !/jp|japan/i.test(q)) q += ' JP';
       if (kind && kind !== 'game' && kind !== 'accessory' && !/system|console/i.test(q)) q += ' system';
@@ -591,14 +612,16 @@ window.TROVE_CONFIG = {
       throw err;
     }
     const rows = parsePC(html);
-    const row = pickRow(rows, region, query, kind);
+    const row = pickRow(rows, region, resolved || query, kind);
     if (!row) {
       if (old) return Object.assign({}, old.v, { stale: true, cachedAt: old.t });
       throw new Error(isUpc(query)
-        ? 'That barcode isn’t in the price database — type the title instead'
+        ? (resolved
+          ? 'Found “' + resolved + '”, but it has no price listing — search the title instead'
+          : 'That barcode isn’t in any product database — type the title instead')
         : 'No market data found for “' + query + '” — try the exact title');
     }
-    const out = { row, rows };
+    const out = { row, rows, resolvedFrom: resolved };
     cachePut(key, out);
     return out;
   }
@@ -631,8 +654,17 @@ window.TROVE_CONFIG = {
     async signOut() { if (supa) await supa.auth.signOut(); householdId = null; },
 
     async joinHousehold(code) {
+      if (!supa) await initCloud();
       if (!supa) throw new Error('Cloud sync is not configured yet — see README.');
-      const { data: me } = await supa.auth.getUser();
+      let { data: me } = await supa.auth.getUser();
+      if (!me || !me.user) {
+        // No email needed: a code holder joins as an anonymous member of the household.
+        const { data: anon, error: anonErr } = await supa.auth.signInAnonymously();
+        if (anonErr || !anon || !anon.user) {
+          throw new Error('Turn on “Allow anonymous sign-ins” in Supabase → Authentication → Sign In / Providers, then try the code again.');
+        }
+        me = { user: anon.user };
+      }
       const { data: hh } = await supa.from('households').select('id').eq('code', code.trim().toUpperCase()).single();
       if (!hh) throw new Error('No household with that code.');
       await supa.from('memberships').insert({ user_id: me.user.id, household_id: hh.id });
@@ -753,14 +785,16 @@ window.TROVE_CONFIG = {
         return { query, market: r, tiers: { loose: r.loose, cib: r.cib, sealed: r.sealed },
           soldMedian: condition === 'sealed' || condition === 'new' ? (r.sealed || r.cib || r.loose)
             : condition === 'cib' ? (r.cib || r.loose) : (r.loose || r.cib),
-          image: r.image, pcUrl: r.url, listings: [], askUnknown: true, stale: m.stale, cachedAt: m.cachedAt };
+          image: r.image, pcUrl: r.url, listings: [], askUnknown: true, stale: m.stale, cachedAt: m.cachedAt,
+          resolvedFrom: m.resolvedFrom };
       }
       const marketOnly = () => {
         const r = m.row;
         return { query, market: r, tiers: { loose: r.loose, cib: r.cib, sealed: r.sealed },
           soldMedian: condition === 'sealed' ? (r.sealed || r.cib || r.loose)
             : condition === 'cib' ? (r.cib || r.loose) : (r.loose || r.cib),
-          image: r.image, pcUrl: r.url, listings: [], askUnknown: true, stale: m.stale, cachedAt: m.cachedAt };
+          image: r.image, pcUrl: r.url, listings: [], askUnknown: true, stale: m.stale, cachedAt: m.cachedAt,
+          resolvedFrom: m.resolvedFrom };
       };
       let res;
       try {
@@ -778,7 +812,7 @@ window.TROVE_CONFIG = {
       out.market = m.row;
       out.tiers = { loose: m.row.loose, cib: m.row.cib, sealed: m.row.sealed };
       if (!out.image) out.image = m.row.image;
-      out.stale = m.stale; out.cachedAt = m.cachedAt;
+      out.stale = m.stale; out.cachedAt = m.cachedAt; out.resolvedFrom = m.resolvedFrom;
       return out;
     },
 
@@ -860,7 +894,7 @@ window.TROVE_CONFIG = {
   const markSeen = () => localStorage.setItem(SEEN_KEY, String(Date.now()));
 
   let ui = { tab: 'browse', q: '', plat: 'all', kind: 'all', era: 'all', region: 'all', sort: 'steal', detail: null, sheet: null, attachItem: null, draft: '', authEmail: '' };
-  let toastT = null;
+  let toastT = null, qT = null, haulT = null;
 
   function setUI(patch) { Object.assign(ui, patch); render(); }
   function toast(msg) {
@@ -967,7 +1001,10 @@ window.TROVE_CONFIG = {
 
   // ---------- barcode scanner ----------
   // Native BarcodeDetector where it exists (Android/Chrome), ZXing everywhere else (iOS).
-  const scan = { code: null, busy: false, result: null, err: null, kind: 'game', cond: 'used' };
+  const SCANLOG_KEY = 'trove.scans.v1';
+  const scan = { code: null, busy: false, result: null, err: null, kind: 'game', cond: 'used', engine: null,
+    log: (() => { try { return JSON.parse(localStorage.getItem(SCANLOG_KEY) || '[]'); } catch (e) { return []; } })() };
+  const saveScans = () => { try { localStorage.setItem(SCANLOG_KEY, JSON.stringify(scan.log.slice(0, 40))); } catch (e) {} };
   let scanVideo = null, scanStream = null, scanTimer = null, scanReader = null;
 
   async function startScan() {
@@ -1000,7 +1037,9 @@ window.TROVE_CONFIG = {
     render();
 
     const FORMATS = ['ean_13', 'upc_a', 'upc_e', 'ean_8', 'code_128'];
+    scan.engine = 'starting';
     if ('BarcodeDetector' in window) {
+      scan.engine = 'native';
       let det;
       try { det = new window.BarcodeDetector({ formats: FORMATS }); } catch (err) { det = new window.BarcodeDetector(); }
       scanTimer = setInterval(async () => {
@@ -1012,17 +1051,19 @@ window.TROVE_CONFIG = {
     }
     try {
       const zx = await import('https://esm.sh/@zxing/library@0.21.3');
+      scan.engine = 'zxing'; render();
       scanReader = new zx.BrowserMultiFormatReader();
       scanReader.decodeFromVideoElement(scanVideo, (res) => { if (res && !scan.busy) onCode(res.getText()); })
         .catch(() => {});
     } catch (err) {
-      scan.err = 'Scanner couldn’t load — type the numbers under the barcode.';
+      scan.engine = null;
+      scan.err = 'The scanner library couldn’t load — type the numbers under the barcode.';
       render();
     }
   }
 
   function stopScan() {
-    clearInterval(scanTimer); scanTimer = null;
+    clearInterval(scanTimer); scanTimer = null; scan.engine = null;
     if (scanReader) { try { scanReader.reset(); } catch (err) {} scanReader = null; }
     if (scanStream) { scanStream.getTracks().forEach((t) => t.stop()); scanStream = null; }
     if (scanVideo) { scanVideo.srcObject = null; if (scanVideo.parentNode) scanVideo.parentNode.removeChild(scanVideo); }
@@ -1040,8 +1081,13 @@ window.TROVE_CONFIG = {
     if (navigator.vibrate) navigator.vibrate(30);
     render();
     try {
-      scan.result = await S.quickLook(code, scan.cond, 'en', scan.kind);
-      scan.result.code = code;
+      const r = await S.quickLook(code, scan.cond, 'en', scan.kind);
+      r.code = code;
+      scan.result = r;
+      const name = (r.market && r.market.title) || r.query;
+      scan.log = [{ code, name, market: Math.round(r.soldMedian || 0), image: r.image || null,
+        kind: scan.kind, cond: scan.cond, t: Date.now() }].concat(scan.log.filter((x) => x.code !== code)).slice(0, 40);
+      saveScans();
     } catch (err) { scan.err = err.message; }
     scan.busy = false;
     render();
@@ -1172,22 +1218,38 @@ window.TROVE_CONFIG = {
         ${sorts.map(([k, l]) => `<button data-sort="${k}" aria-pressed="${ui.sort === k}">${esc(l)}</button>`).join('')}
       </div>
 
-      <div class="kicker" style="margin-bottom:8px">${list.length} tracked${steals ? ' · ' + steals + ' steal' + (steals > 1 ? 's' : '') : ''}</div>
+      <div class="kicker" id="browseCount" style="margin-bottom:8px">${countText(list)}</div>
       <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:12px">
         ${[['scan', ICON.scan, 'Scan'], ['quick', ICON.chart, 'Price'], ['haul', ICON.box, 'Haul'], ['add', ICON.plus, 'Track']]
           .map(([k, i, l]) => `<button class="btn btn-ghost" data-sheet="${k}"
             style="flex-direction:column;gap:3px;padding:9px 4px;font-size:11px;min-width:0">${svg(i, 17)}<span>${l}</span></button>`).join('')}
       </div>
 
-      <div style="display:flex;flex-direction:column;gap:9px">
-        ${list.length ? list.map(itemRow).join('')
-        : `<div style="text-align:center;padding:34px 18px;border:1px dashed var(--n-400);border-radius:26px">
-             <div class="disp" style="font-size:18px">Nothing matches that</div>
-             <p class="muted" style="font-size:12px;margin:8px 0 0">Try a different platform, or track it by name.</p>
-             <button class="btn btn-secondary" data-sheet="add" style="margin-top:12px">Track “${esc(ui.q || 'a new item')}”</button>
-           </div>`}
-      </div>
+      <div id="resultList" style="display:flex;flex-direction:column;gap:9px">${listHtml(list)}</div>
     </div>`;
+  }
+
+  const countText = (list) => {
+    const steals = list.filter((i) => deal(i) >= 0.38).length;
+    return list.length + ' tracked' + (steals ? ' · ' + steals + ' steal' + (steals > 1 ? 's' : '') : '');
+  };
+  const listHtml = (list) => (list.length ? list.map(itemRow).join('')
+    : `<div style="text-align:center;padding:34px 18px;border:1px dashed var(--n-400);border-radius:26px">
+         <div class="disp" style="font-size:18px">Nothing matches that</div>
+         <p class="muted" style="font-size:12px;margin:8px 0 0">Try a different platform, or track it by name.</p>
+         <button class="btn btn-secondary" data-sheet="add" style="margin-top:12px">Track “${esc(ui.q || 'a new item')}”</button>
+       </div>`);
+
+  // Typing must never rebuild the screen — only the rows below the box change.
+  function paintResults() {
+    const box = $('resultList');
+    if (!box || ui.tab !== 'browse') return render();
+    const list = catalog();
+    box.innerHTML = listHtml(list);
+    const c = $('browseCount');
+    if (c) c.textContent = countText(list);
+    const sb = $('searchBox');
+    if (sb) painted.searchBox = sb.value;
   }
 
   function stealsScreen() {
@@ -1367,7 +1429,10 @@ window.TROVE_CONFIG = {
         </div>
         ${S.signedIn
       ? `<button class="btn btn-secondary btn-block" data-signout="1" style="margin-top:12px">Sign out</button>`
-      : `<button class="btn btn-primary btn-block" data-sheet="signin" style="margin-top:12px">Sign in to sync</button>`}
+      : `<div style="display:flex;gap:8px;margin-top:12px">
+            <button class="btn btn-primary" data-sheet="join" style="flex:1">Join with a code</button>
+            <button class="btn btn-secondary" data-sheet="signin" style="flex:1">Sign in by email</button>
+          </div>`}
       </div>
 
       <div class="card" style="margin-top:12px">
@@ -1674,7 +1739,13 @@ window.TROVE_CONFIG = {
           </div>`}
       </div>
 
-      ${scan.err ? `<p class="muted" style="font-size:12px;margin-top:10px">${esc(scan.err)}</p>` : ''}
+      ${live ? `<div class="kicker" style="margin-top:9px">${scan.engine === 'native' ? 'Scanner running · hold the barcode steady in the frame'
+        : scan.engine === 'zxing' ? 'Scanner running (fallback reader) · hold steady'
+        : 'Starting the scanner…'}</div>` : ''}
+      ${scan.err ? `<div class="card" style="margin-top:10px;background:var(--accent-100)">
+          <div style="font-size:12.5px;font-weight:700;color:var(--accent-800)">${esc(scan.err)}</div>
+          <button class="btn btn-secondary" data-sheet="quick" style="margin-top:10px;font-size:12.5px">Search by title instead</button>
+        </div>` : ''}
 
       <div style="display:flex;gap:9px;margin-top:10px">
         <select class="in" id="scanKind" style="flex:1">
@@ -1709,6 +1780,7 @@ window.TROVE_CONFIG = {
             <div style="min-width:0">
               <div class="disp" style="font-size:17px">${esc((r.market && r.market.title) || r.query)}</div>
               <div class="kicker" style="margin-top:4px">${esc((r.market && r.market.console) || '')}${r.code ? ' · ' + esc(r.code) : ''}</div>
+              ${r.resolvedFrom ? `<div style="font-size:10.5px;color:var(--accent-300);margin-top:3px">barcode matched “${esc(r.resolvedFrom)}”</div>` : ''}
             </div>
           </div>
           ${r.stale ? `<div class="kicker" style="margin-top:10px;color:var(--accent-300)">No signal — last checked ${ago(r.cachedAt)}</div>` : ''}
@@ -1727,12 +1799,51 @@ window.TROVE_CONFIG = {
         <button class="btn btn-sage" data-scantrack="1" style="flex:1">Track this</button>
         <button class="btn btn-secondary" data-scanhaul="1">Add to haul</button>
         <button class="btn btn-secondary" data-scannext="1">Next</button>
+      </div>` : ''}
+
+      ${scan.log.length ? `<div style="display:flex;align-items:baseline;margin:20px 0 8px">
+        <h4 style="margin:0">Scanned</h4>
+        <button class="btn btn-ghost" data-scanlogclear="1" style="margin-left:auto;font-size:11.5px">Clear</button>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        ${scan.log.map((h, i) => `<div class="row" style="cursor:default;min-height:60px">
+          ${h.image ? `<div class="art" style="width:38px;height:38px;background:#fff;flex:none"><img src="${esc(h.image)}" alt="" style="object-fit:contain;padding:3px"></div>` : ''}
+          <div style="flex:1;min-width:0">
+            <div class="ellip" style="font-size:12.5px;font-weight:700">${esc(h.name)}</div>
+            <div class="muted" style="font-size:10.5px;margin-top:2px">${money(h.market)} · ${esc(condLabel(h.cond))} · ${esc(h.code)}</div>
+          </div>
+          <button class="btn btn-ghost" data-scanloghaul="${i}" style="font-size:11.5px;flex:none">+ Haul</button>
+        </div>`).join('')}
       </div>` : ''}`,
       [`<button class="btn btn-secondary" data-close="1" style="flex:1">Done</button>`]);
   }
 
-  function haulSheet() {
+  function haulTotalsHtml() {
     const t = haulTotals();
+    const verdict = !t.ask
+      ? { col: 'var(--accent-100)', txt: 'Put in what they\'re asking for each piece to get the offer.' }
+      : t.ask <= t.max
+        ? { col: 'var(--sage-300)', txt: 'Buy it — ' + money(t.max - t.ask) + ' below your walk-away number.' }
+        : { col: 'var(--accent-300)', txt: 'Offer ' + money(t.max) + ' for the lot. Walk above that.' };
+    return `<div class="cab" style="margin-top:14px">
+        <span class="scan"></span>
+        <div style="position:relative">
+          <div class="kicker">${haul.length} piece${haul.length > 1 ? 's' : ''} in the pile</div>
+          <div style="display:flex;align-items:flex-end;gap:16px;margin-top:10px">
+            <div><div class="kicker">Lot is worth</div><div class="disp" style="font-size:28px">${money(t.market)}</div></div>
+            <div style="margin-left:auto;text-align:right"><div class="kicker">Pay no more than</div><div class="disp" style="font-size:24px;color:var(--sage-300)">${money(t.max)}</div></div>
+          </div>
+          ${t.ask ? `<div style="display:flex;gap:8px;margin-top:13px">
+            <div class="stat"><b>${money(t.ask)}</b><span>They want</span></div>
+            <div class="stat"><b>${money(t.net)}</b><span>Net after fees</span></div>
+            <div class="stat"><b style="color:${t.profit >= 0 ? 'var(--sage-300)' : 'var(--accent-300)'}">${money(t.profit)}</b><span>Profit</span></div>
+          </div>` : ''}
+          <div style="margin-top:13px;font-size:12.5px;font-weight:700;color:${verdict.col}">${esc(verdict.txt)}</div>
+        </div>
+      </div>`;
+  }
+
+  function haulSheet() {
     const rows = haul.map((h, i) => `<div class="row" style="cursor:default">
       ${h.image ? `<div class="art" style="width:40px;height:40px;background:#fff;flex:none"><img src="${esc(h.image)}" alt="" style="object-fit:contain;padding:3px"></div>` : ''}
       <div style="flex:1;min-width:0">
@@ -1743,12 +1854,6 @@ window.TROVE_CONFIG = {
         value="${h.ask || ''}" style="width:64px;flex:none;text-align:right;padding:7px 8px">
       <button class="icon-btn" data-haulrm="${i}" aria-label="Remove" style="width:32px;height:32px;background:transparent;flex:none">${svg(ICON.x, 14)}</button>
     </div>`).join('');
-
-    const verdict = !t.ask
-      ? { col: 'var(--accent-100)', txt: 'Put in what they\'re asking for each piece to get the offer.' }
-      : t.ask <= t.max
-        ? { col: 'var(--sage-300)', txt: 'Buy it — ' + money(t.max - t.ask) + ' below your walk-away number.' }
-        : { col: 'var(--accent-300)', txt: 'Offer ' + money(t.max) + ' for the lot. Walk above that.' };
 
     return sheet(`<h4 style="margin:0 0 4px">Price the whole pile</h4>
       <p class="muted" style="font-size:12.5px">Box lot, table, estate sale bin — add everything, and Trove totals what it's worth and the most the lot is worth paying.</p>
@@ -1772,22 +1877,7 @@ window.TROVE_CONFIG = {
 
       ${haul.length ? `<div style="display:flex;flex-direction:column;gap:8px;margin-top:14px">${rows}</div>
 
-      <div class="cab" style="margin-top:14px">
-        <span class="scan"></span>
-        <div style="position:relative">
-          <div class="kicker">${haul.length} piece${haul.length > 1 ? 's' : ''} in the pile</div>
-          <div style="display:flex;align-items:flex-end;gap:16px;margin-top:10px">
-            <div><div class="kicker">Lot is worth</div><div class="disp" style="font-size:28px">${money(t.market)}</div></div>
-            <div style="margin-left:auto;text-align:right"><div class="kicker">Pay no more than</div><div class="disp" style="font-size:24px;color:var(--sage-300)">${money(t.max)}</div></div>
-          </div>
-          ${t.ask ? `<div style="display:flex;gap:8px;margin-top:13px">
-            <div class="stat"><b>${money(t.ask)}</b><span>They want</span></div>
-            <div class="stat"><b>${money(t.net)}</b><span>Net after fees</span></div>
-            <div class="stat"><b style="color:${t.profit >= 0 ? 'var(--sage-300)' : 'var(--accent-300)'}">${money(t.profit)}</b><span>Profit</span></div>
-          </div>` : ''}
-          <div style="margin-top:13px;font-size:12.5px;font-weight:700;color:${verdict.col}">${esc(verdict.txt)}</div>
-        </div>
-      </div>`
+      <div id="haulTotals">${haulTotalsHtml()}</div>`
       : `<div style="text-align:center;padding:30px 18px;border:1px dashed var(--n-400);border-radius:26px;margin-top:14px">
            <div class="disp" style="font-size:17px">Nothing in the pile yet</div>
            <p class="muted" style="font-size:12px;margin:8px 0 0">Add pieces one by one — the totals update as you go.</p>
@@ -1855,6 +1945,16 @@ window.TROVE_CONFIG = {
           <a class="btn btn-secondary" href="${D.priceCharting(ui.quickQ || 'retro game')}" target="_blank" rel="noopener" style="flex:1;font-size:12.5px">PriceCharting ${svg(ICON.out, 13)}</a>
         </div>`}`,
       [`<button class="btn btn-secondary" data-close="1" style="flex:1">Done</button>`]);
+  }
+
+  function joinSheet() {
+    return sheet(`<h4 style="margin:0 0 4px">Join a household</h4>
+      <p class="muted" style="font-size:12.5px">No email, no password. Get the invite code off the other phone (You tab) and type it here — both phones then share the same list, watchlist and chat.</p>
+      <div style="margin-top:14px"><label class="f">Invite code</label>
+        <input class="in" id="joinCode2" placeholder="TROVE-0000" autocomplete="off"
+          style="letter-spacing:.1em;font-family:var(--font-h);text-transform:uppercase"></div>
+      <p class="muted" style="font-size:11.5px;margin-top:12px">Anyone with the code can see and edit the household, so keep it between you.</p>`,
+      [`<button class="btn btn-primary" data-join2="1" style="flex:1">Join</button>`]);
   }
 
   function signinSheet() {
@@ -1986,10 +2086,14 @@ window.TROVE_CONFIG = {
           : ui.sheet === 'quick' ? quickSheet()
           : ui.sheet === 'haul' ? haulSheet()
           : ui.sheet === 'scan' ? scanSheet()
+          : ui.sheet === 'join' ? joinSheet()
           : ui.sheet === 'attach' ? attachSheet()
             : ui.sheet === 'signin' ? signinSheet() : '');
 
-    if (ui.tab === 'browse' && ui.qFocus) { const b = $('searchBox'); if (b) { b.focus(); b.setSelectionRange(b.value.length, b.value.length); } }
+    if (ui.tab === 'browse' && ui.qFocus && document.activeElement !== $('searchBox')) {
+      const b = $('searchBox');
+      if (b) { b.focus({ preventScroll: true }); b.setSelectionRange(b.value.length, b.value.length); }
+    }
     if (ui.tab === 'chat' && ui.draft) { const b = $('msgBox'); if (b) b.value = ui.draft; }
     if (ui.sheet === 'scan') mountScan(); else if (scanStream) stopScan();
     wireSheet();
@@ -2043,7 +2147,7 @@ window.TROVE_CONFIG = {
 
   // ---------- events ----------
   document.addEventListener('click', async (e) => {
-    const el = e.target.closest('[data-tab],[data-open],[data-close],[data-backdrop],[data-sheet],[data-sort],[data-kind],[data-plat],[data-era],[data-clearq],[data-watch],[data-unwatch],[data-refresh],[data-add],[data-logflip],[data-delflip],[data-togglefees],[data-signout],[data-sendlink],[data-verify],[data-join],[data-repair],[data-reset],[data-send],[data-unattach],[data-pickattach],[data-clearphoto],[data-tochat],[data-refreshall],[data-lookup],[data-quickadd],[data-copytitle],[data-arturl],[data-remove],[data-region],[data-margin],[data-hauladd],[data-haulrm],[data-haulclear],[data-haultrack],[data-scanstart],[data-scanmanual],[data-scannext],[data-scantrack],[data-scanhaul]');
+    const el = e.target.closest('[data-tab],[data-open],[data-close],[data-backdrop],[data-sheet],[data-sort],[data-kind],[data-plat],[data-era],[data-clearq],[data-watch],[data-unwatch],[data-refresh],[data-add],[data-logflip],[data-delflip],[data-togglefees],[data-signout],[data-sendlink],[data-verify],[data-join],[data-repair],[data-reset],[data-send],[data-unattach],[data-pickattach],[data-clearphoto],[data-tochat],[data-refreshall],[data-lookup],[data-quickadd],[data-copytitle],[data-arturl],[data-remove],[data-region],[data-margin],[data-hauladd],[data-haulrm],[data-haulclear],[data-haultrack],[data-scanstart],[data-scanmanual],[data-scannext],[data-scantrack],[data-scanhaul],[data-scanloghaul],[data-scanlogclear],[data-join2]');
     if (!el) return;
     const d = el.dataset;
     if (el.tagName === 'A') return;
@@ -2110,9 +2214,19 @@ window.TROVE_CONFIG = {
     if (d.scanstart) { return startScan(); }
     if (d.scanmanual) {
       const code = ((($('scanManual') || {}).value) || '').replace(/\D/g, '');
-      if (code.length < 8) return toast('Type all the digits under the barcode');
+      if (code.length < 8) return toast('Type all the digits under the barcode — usually 12');
       scan.code = null;
+      toast('Looking up ' + code + '…');
       return onCode(code);
+    }
+    if (d.scanlogclear) { scan.log = []; saveScans(); return render(); }
+    if (d.scanloghaul) {
+      const h = scan.log[parseInt(d.scanloghaul, 10)];
+      if (!h) return;
+      haul.push({ name: h.name, market: h.market, kind: h.kind, cond: h.cond, region: 'en', image: h.image,
+        max: maxBuy({ id: h.name, kind: h.kind, cond: h.cond, sell: h.market }), ask: 0 });
+      saveHaul();
+      return toast(h.name + ' added to the haul');
     }
     if (d.scannext) { scan.code = null; scan.result = null; scan.err = null; render(); if (!scanStream) startScan(); return; }
     if (d.scantrack && scan.result) {
@@ -2279,6 +2393,14 @@ window.TROVE_CONFIG = {
       catch (err) { toast(err.message); }
       return;
     }
+    if (d.join2) {
+      const code = ((($('joinCode2') || {}).value) || '').trim().toUpperCase();
+      if (!code) return toast('Enter the invite code');
+      toast('Joining…');
+      try { await S.joinHousehold(code); toast('Joined — you two are in sync'); setUI({ sheet: null }); }
+      catch (err) { toast(err.message); }
+      return;
+    }
     if (d.join) {
       const code = ($('joinCode').value || '').trim();
       if (!code) return toast('Enter the invite code');
@@ -2300,10 +2422,21 @@ window.TROVE_CONFIG = {
   document.addEventListener('input', (e) => {
     if (e.target.dataset && e.target.dataset.haulask !== undefined) {
       const i = parseInt(e.target.dataset.haulask, 10);
-      if (haul[i]) { haul[i].ask = parseFloat(e.target.value) || 0; saveHaul(); render(); }
+      if (!haul[i]) return;
+      haul[i].ask = parseFloat(e.target.value) || 0;
+      saveHaul();
+      clearTimeout(haulT);
+      haulT = setTimeout(() => {                      // totals only — the rows keep their carets
+        const box = $('haulTotals');
+        if (box) box.innerHTML = haulTotalsHtml();
+      }, 160);
       return;
     }
-    if (e.target.id === 'searchBox') { ui.q = e.target.value; ui.qFocus = true; return render(); }
+    if (e.target.id === 'searchBox') {
+      ui.q = e.target.value; ui.qFocus = true;
+      clearTimeout(qT); qT = setTimeout(paintResults, 130);
+      return;
+    }
     if (e.target.id === 'msgBox') { ui.draft = e.target.value; return; }
     if (e.target.id === 'meName') { setMe(e.target.value.trim() || 'Me'); return; }
   });

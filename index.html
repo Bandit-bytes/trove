@@ -1061,6 +1061,50 @@ window.TROVE_CONFIG = {
   const lastSeen = () => parseInt(localStorage.getItem(SEEN_KEY) || '0', 10);
   const markSeen = () => localStorage.setItem(SEEN_KEY, String(Date.now()));
 
+  // ---------- message notifications ----------
+  // Off until asked for, and per-device: the toggle lives in localStorage so turning
+  // it off on your phone doesn't switch it off on hers.
+  const NOTIF_KEY = 'trove.notify';
+  const NOTIF_AT = 'trove.notify.at';
+  const notifOn = () => localStorage.getItem(NOTIF_KEY) === '1';
+  const notifSupported = () => typeof Notification !== 'undefined';
+  const notifBlocked = () => notifSupported() && Notification.permission === 'denied';
+  const notifAt = () => parseInt(localStorage.getItem(NOTIF_AT) || String(Date.now()), 10);
+
+  async function enableNotifs() {
+    if (!notifSupported()) return toast('This browser can’t show notifications');
+    let perm = Notification.permission;
+    if (perm === 'default') { try { perm = await Notification.requestPermission(); } catch (e) { perm = 'denied'; } }
+    if (perm !== 'granted') { render(); return toast('Notifications are blocked in your browser settings'); }
+    localStorage.setItem(NOTIF_KEY, '1');
+    localStorage.setItem(NOTIF_AT, String(Date.now()));
+    render(); toast('Notifications on');
+  }
+  function disableNotifs() {
+    localStorage.setItem(NOTIF_KEY, '0');
+    render(); toast('Notifications off');
+  }
+
+  // Fired from the store subscription, so a message that arrives from the other phone
+  // notifies once — never for your own messages, never while you're reading the chat.
+  function notifyNew() {
+    if (!notifOn() || !notifSupported() || Notification.permission !== 'granted') return;
+    const since = notifAt();
+    const mine = meName();
+    const fresh = (st().messages || []).filter((m) => m.t > since && m.by !== mine);
+    if (!fresh.length) return;
+    localStorage.setItem(NOTIF_AT, String(Math.max(...fresh.map((m) => m.t))));
+    const reading = ui.tab === 'chat' && !document.hidden;
+    if (reading) return;
+    const last = fresh[fresh.length - 1];
+    const body = fresh.length > 1 ? fresh.length + ' new messages · ' + (last.text || 'shared an item')
+      : (last.text || 'shared an item');
+    try {
+      const n = new Notification('Trove — ' + last.by, { body, tag: 'trove-chat', icon: 'icon-192.png' });
+      n.onclick = () => { try { window.focus(); } catch (e) {} setUI({ tab: 'chat', sheet: null, detail: null }); markSeen(); n.close(); };
+    } catch (e) {}
+  }
+
   let ui = { tab: 'browse', q: '', plat: 'all', kind: 'all', era: 'all', region: 'all', sort: 'steal', detail: null, sheet: null, attachItem: null, draft: '', authEmail: '' };
   let toastT = null, qT = null, haulT = null;
 
@@ -1796,6 +1840,19 @@ window.TROVE_CONFIG = {
         <label class="f">Your name in this household</label>
         <input class="in" id="meName" value="${esc(meName())}" placeholder="Riley">
         <div class="muted" style="font-size:10.5px;margin-top:6px">Shown on your chat messages and the flips you log.</div>
+      </div>
+
+      <h4 style="margin:22px 0 10px">Notifications</h4>
+      <div class="card">
+        <div style="display:flex;align-items:center;gap:10px">
+          <div style="flex:1">
+            <div style="font-size:12.5px;font-weight:700">Tell me about new messages</div>
+            <div class="muted" style="font-size:10.5px">${notifBlocked()
+              ? 'Blocked in your browser — allow notifications for this site, then flip this on'
+              : notifOn() ? 'On for this device only — silent while you’re on the Chat tab' : 'Off — the chat tab still shows a dot'}</div>
+          </div>
+          <button class="switch" data-togglenotif="1" role="switch" aria-checked="${notifOn()}" ${notifBlocked() ? 'disabled' : ''}><i></i></button>
+        </div>
       </div>
 
       <h4 style="margin:22px 0 10px">Selling assumptions</h4>
@@ -2534,7 +2591,7 @@ window.TROVE_CONFIG = {
 
   // ---------- events ----------
   document.addEventListener('click', async (e) => {
-    const el = e.target.closest('[data-tab],[data-open],[data-close],[data-backdrop],[data-sheet],[data-sort],[data-kind],[data-plat],[data-era],[data-clearq],[data-watch],[data-unwatch],[data-refresh],[data-add],[data-logflip],[data-delflip],[data-togglefees],[data-signout],[data-sendlink],[data-verify],[data-join],[data-repair],[data-reset],[data-send],[data-unattach],[data-pickattach],[data-clearphoto],[data-tochat],[data-refreshall],[data-lookup],[data-quickadd],[data-copytitle],[data-arturl],[data-remove],[data-region],[data-margin],[data-hauladd],[data-haulrm],[data-haulclear],[data-haultrack],[data-scanstart],[data-scanstop],[data-scankind],[data-scancond],[data-scanprice],[data-scanclear],[data-scanmanual],[data-scannext],[data-scantrack],[data-scanhaul],[data-scanloghaul],[data-scanlogclear],[data-join2]');
+    const el = e.target.closest('[data-tab],[data-open],[data-close],[data-backdrop],[data-sheet],[data-sort],[data-kind],[data-plat],[data-era],[data-clearq],[data-watch],[data-unwatch],[data-refresh],[data-add],[data-logflip],[data-delflip],[data-togglefees],[data-togglenotif],[data-signout],[data-sendlink],[data-verify],[data-join],[data-repair],[data-reset],[data-send],[data-unattach],[data-pickattach],[data-clearphoto],[data-tochat],[data-refreshall],[data-lookup],[data-quickadd],[data-copytitle],[data-arturl],[data-remove],[data-region],[data-margin],[data-hauladd],[data-haulrm],[data-haulclear],[data-haultrack],[data-scanstart],[data-scanstop],[data-scankind],[data-scancond],[data-scanprice],[data-scanclear],[data-scanmanual],[data-scannext],[data-scantrack],[data-scanhaul],[data-scanloghaul],[data-scanlogclear],[data-join2]');
     if (!el) return;
     const d = el.dataset;
     if (el.tagName === 'A') return;
@@ -2765,6 +2822,8 @@ window.TROVE_CONFIG = {
     }
     if (d.delflip) { S.update((s) => { s.flips = s.flips.filter((f) => f.id !== d.delflip); }); return; }
 
+    if (d.togglenotif) { if (notifOn()) disableNotifs(); else await enableNotifs(); return; }
+
     if (d.togglefees) { S.update((s) => { s.settings.fees = !s.settings.fees; }); return; }
 
     if (d.send) {
@@ -2897,6 +2956,7 @@ window.TROVE_CONFIG = {
   window.addEventListener('pagehide', () => stopScan());
 
   S.on(renderBg);
+  S.on(notifyNew);
   render();
 
   // Photos are fetched once and kept on the item; prices only refresh when asked.

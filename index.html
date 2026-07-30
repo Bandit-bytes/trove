@@ -200,7 +200,7 @@ window.TROVE_CONFIG = {
   const q = encodeURIComponent;
 
   const SOURCES = [
-    { key: 'ebay', name: 'eBay', kind: 'resale', url: (n) => `https://www.ebay.com/sch/i.html?_nkw=${q(n)}&LH_BIN=1&_sop=15` },
+    { key: 'ebay', name: 'eBay', kind: 'resale', url: (n) => ebay(kw(n, WORKING, 'en'), '&LH_BIN=1&_sop=15') },
     { key: 'mercari', name: 'Mercari', kind: 'resale', url: (n) => `https://www.mercari.com/search/?keyword=${q(n)}&sortBy=2` },
     { key: 'fbmp', name: 'FB Marketplace', kind: 'resale', url: (n) => `https://www.facebook.com/marketplace/search/?query=${q(n)}` },
     { key: 'offerup', name: 'OfferUp', kind: 'resale', url: (n) => `https://offerup.com/search?q=${q(n)}` },
@@ -210,7 +210,62 @@ window.TROVE_CONFIG = {
     { key: 'amazon', name: 'Amazon', kind: 'retail', url: (n) => `https://www.amazon.com/s?k=${q(n)}` },
   ];
 
-  const soldComps = (n) => `https://www.ebay.com/sch/i.html?_nkw=${q(n)}&LH_Sold=1&LH_Complete=1&_sop=13`;
+  // ---- Search grammar ----
+  // eBay understands three things that make a search useful:
+  //   (a,b,c) = OR group   -word / -"two words" = exclude   _udhi = price ceiling
+  // It also caps _nkw at 300 characters, so the exclusions are priority-ordered and
+  // only as many as fit are appended — a truncated query silently drops its filters.
+  const NKW_MAX = 300;
+  const JUNK = ['-parts', '-repair', '-broken', '-repro', '-reproduction', '-"box only"',
+    '-"manual only"', '-"case only"', '-"disc only"', '-"not working"', '-bootleg', '-damaged'];
+  const REGION_NEG = { en: ['-japanese', '-japan', '-pal'], jp: [], pal: ['-japanese'] };
+  const WORKING = '(tested,working,functional)';
+  const COMPLETE = '(cib,complete,"complete in box")';
+
+  // Assemble a keyword string that fits: title and OR group always survive, then
+  // region excludes, then junk excludes until the budget runs out.
+  function kw(name, group, regionKey) {
+    let s = String(name).trim();
+    if (group) s += ' ' + group;
+    const opt = (REGION_NEG[regionKey || 'en'] || []).concat(JUNK);
+    for (const t of opt) { if (s.length + 1 + t.length <= NKW_MAX) s += ' ' + t; }
+    return s;
+  }
+
+  const ebay = (keywords, tail) => `https://www.ebay.com/sch/i.html?_nkw=${q(keywords)}${tail || ''}`;
+  const cap = (n) => (n && n > 0 ? '&_udhi=' + Math.round(n) : '');
+
+  // Buy-side searches, in the order a picker actually uses them.
+  function dealLinks(name, opts) {
+    const o = opts || {};
+    const r = o.region || 'en';
+    const under = cap(o.maxBuy);
+    return [
+      { key: 'working', name: 'Tested & working under ' + (o.maxBuy ? '$' + Math.round(o.maxBuy) : 'market'),
+        why: 'Buy It Now, cheapest first, only listings that claim it was tested',
+        url: ebay(kw(name, WORKING, r), '&LH_BIN=1&_sop=15' + under) },
+      { key: 'complete', name: 'Complete in box under market',
+        why: 'CIB copies at or below the loose-plus-box spread',
+        url: ebay(kw(name, COMPLETE, r), '&LH_BIN=1&_sop=15' + cap(o.cibCap)) },
+      { key: 'auction', name: 'Auctions ending within the hour',
+        why: 'Where the real underbids happen — few watchers left to react',
+        url: ebay(kw(name, WORKING, r), '&LH_Auction=1&_sop=1' + under) },
+      { key: 'new', name: 'Newly listed auctions',
+        why: 'Just posted, sorted newest — get there before the watchers do',
+        url: ebay(kw(name, WORKING, r), '&LH_Auction=1&_sop=10' + under) },
+      { key: 'lots', name: 'Bundles & lots',
+        why: 'Buy the pile, keep one, flip the rest',
+        url: ebay(kw(name, '(lot,bundle,collection)', r), '&_sop=15') },
+      { key: 'local', name: 'Local pickup only',
+        why: 'No shipping to eat the margin',
+        url: ebay(kw(name, WORKING, r), '&LH_BIN=1&_sop=15&LH_LPickup=1' + under) },
+    ];
+  }
+
+  // Sold-comps links with the same junk excluded, so the median you eyeball is clean.
+  const soldComps = (n, r) => ebay(kw(n, null, r), '&LH_Sold=1&LH_Complete=1&_sop=13');
+  const soldCompsCond = (n, r, cond) => ebay(kw(n, cond === 'cib' || cond === 'sealed' ? COMPLETE : null, r),
+    '&LH_Sold=1&LH_Complete=1&_sop=13');
   const priceCharting = (n) => `https://www.pricecharting.com/search-products?q=${q(n)}&type=prices`;
 
   // platform key -> short label + tile colors (from the Organic ramps)
@@ -338,7 +393,21 @@ window.TROVE_CONFIG = {
     { key: 'loose', label: 'Loose' },
   ];
 
-  window.TroveData = { SOURCES, SEED, KINDS, CONDS, ERAS, PLATFORMS, soldComps, priceCharting };
+  // platform key -> how PriceCharting spells that console. Used to keep an English
+  // N64 search from coming back with the Japanese release.
+  const PC_CONSOLE = {
+    switch2: ['nintendo switch 2'], switch: ['nintendo switch'],
+    gb: ['gameboy'], gba: ['gameboy advance'], ds: ['nintendo ds'], n3ds: ['nintendo 3ds'],
+    nes: ['nes'], snes: ['super nintendo'], n64: ['nintendo 64'], gc: ['gamecube'], wii: ['wii'],
+    ps1: ['playstation'], ps2: ['playstation 2'], ps5: ['playstation 5'],
+    psp: ['psp'], vita: ['playstation vita'],
+    xsx: ['xbox series x', 'xbox one', 'xbox'],
+    genesis: ['sega genesis'], saturn: ['sega saturn'], dreamcast: ['sega dreamcast'],
+    neogeo: ['neo geo'], pcwin: ['pc games'], fpga: [], multi: [],
+  };
+
+  window.TroveData = { SOURCES, SEED, KINDS, CONDS, ERAS, PLATFORMS, PC_CONSOLE,
+    soldComps, soldCompsCond, priceCharting, dealLinks };
 })();
 
 </script>
@@ -576,7 +645,7 @@ window.TROVE_CONFIG = {
     const rows = [];
     const body = html.slice(html.indexOf('games_table'));
     const chunks = body.split('<tr id="product-').slice(1);
-    for (const c of chunks.slice(0, 12)) {
+    for (const c of chunks.slice(0, 30)) {
       const img = (c.match(/src="(https:\/\/storage\.googleapis\.com\/images\.pricecharting\.com\/[^"]+)"/) || [])[1] || null;
       const link = (c.match(/href="(https:\/\/www\.pricecharting\.com\/game\/[^"]+)"/) || [])[1] || null;
       const titleBlock = c.slice(c.indexOf('<td class="title"'));
@@ -598,21 +667,50 @@ window.TROVE_CONFIG = {
   // returns the console and not the best-selling game on it.
   const isUpc = (q) => /^\d{8,14}$/.test(String(q).trim());
 
+  // PriceCharting prefixes foreign releases: "JP Nintendo 64", "PAL Gamecube".
+  const isJP = (r) => /^\s*(jp|japan)\b/i.test(r.console || '') || /\bjapan(ese)?\b/i.test(r.console || '');
+  const isPAL = (r) => /^\s*pal\b/i.test(r.console || '');
+  const bareConsole = (r) => String(r.console || '').toLowerCase().replace(/^\s*(jp|pal|japan)\s+/i, '').trim();
+  const pcNames = (platform) => ((window.TroveData && window.TroveData.PC_CONSOLE) || {})[platform] || [];
+
+  // Region and platform are hard constraints, not hints — asking for an English N64
+  // game and getting the Japanese release back is the bug this exists to prevent.
+  function narrow(rows, region, platform) {
+    const note = { droppedRegion: 0, droppedPlatform: 0, regionOnlyOther: false, platformMiss: false };
+    let out = rows;
+    if (region === 'jp') {
+      const jp = out.filter(isJP);
+      if (jp.length) out = jp; else note.regionOnlyOther = true;
+    } else if (region === 'pal') {
+      const pal = out.filter(isPAL);
+      if (pal.length) out = pal; else note.regionOnlyOther = true;
+    } else {
+      const en = out.filter((r) => !isJP(r) && !isPAL(r));
+      note.droppedRegion = out.length - en.length;
+      if (en.length) out = en; else note.regionOnlyOther = true;
+    }
+    const names = pcNames(platform);
+    if (names.length) {
+      const hit = out.filter((r) => names.some((n) => bareConsole(r).includes(n)));
+      if (hit.length) { note.droppedPlatform = out.length - hit.length; out = hit; }
+      else note.platformMiss = true;
+    }
+    return { rows: out, note };
+  }
+
   function pickRow(rows, region, query, kind) {
     if (!rows.length) return null;
     if (isUpc(query)) return rows[0];
     const want = tokens(query);
-    const jp = (r) => /\bJP\b|Japan/i.test(r.console || '');
-    const pal = (r) => /\bPAL\b/i.test(r.console || '');
     const hardware = kind && kind !== 'game';
     const scored = rows.map((r) => {
       const have = tokens(r.title + ' ' + r.console);
       let sc = want.filter((w) => have.includes(w)).length * 3;
-      if (tokens(r.title).join(' ') === want.join(' ')) sc += 6;
+      if (tokens(r.title).join(' ') === want.join(' ')) sc += 8;
+      if (tokens(r.title).join(' ').indexOf(want.join(' ')) === 0) sc += 3;
       if (hardware && /system|console|handheld/i.test(r.title)) sc += 5;
-      if (!hardware && /system|console/i.test(r.title)) sc -= 3;
-      if (region === 'jp') { if (jp(r)) sc += 6; else sc -= 4; }
-      else { if (jp(r) || pal(r)) sc -= 5; }
+      if (!hardware && /system|console/i.test(r.title)) sc -= 4;
+      if (/\b(pin|poster|guide|strategy|soundtrack|promo|demo|not for resale)\b/i.test(r.title)) sc -= 6;
       return { r, sc };
     }).sort((a, b) => b.sc - a.sc);
     return scored[0].r;
@@ -635,8 +733,8 @@ window.TROVE_CONFIG = {
     try { return parse(await viaProxy(url, 9000)); } catch (e) { return null; }
   }
 
-  async function marketLookup(query, region, kind) {
-    const key = (region || 'en') + '|' + (kind || '') + '|' + query.toLowerCase().trim();
+  async function marketLookup(query, region, kind, platform) {
+    const key = (region || 'en') + '|' + (kind || '') + '|' + (platform || '') + '|' + query.toLowerCase().trim();
     const hit = cacheGet(key);
     if (hit) return hit;
     let q = query, resolved = null;
@@ -645,7 +743,12 @@ window.TROVE_CONFIG = {
       if (resolved) q = resolved.replace(/\(.*?\)/g, ' ').replace(/\s+/g, ' ').trim();
     }
     if (!isUpc(q)) {
+      // Naming the console in the query is what makes PriceCharting return the right
+      // release instead of whatever sells best under that title.
+      const names = pcNames(platform);
+      if (names.length && !new RegExp(names[0].replace(/\s+/g, '\\s*'), 'i').test(q)) q += ' ' + names[0];
       if (region === 'jp' && !/jp|japan/i.test(q)) q += ' JP';
+      if (region === 'pal' && !/pal/i.test(q)) q += ' PAL';
       if (kind && kind !== 'game' && kind !== 'accessory' && !/system|console/i.test(q)) q += ' system';
     }
     const url = 'https://www.pricecharting.com/search-products?q=' + encodeURIComponent(q) + '&type=prices';
@@ -656,7 +759,8 @@ window.TROVE_CONFIG = {
       if (old) return Object.assign({}, old.v, { stale: true, cachedAt: old.t });
       throw err;
     }
-    const rows = parsePC(html);
+    const all = parsePC(html);
+    const { rows, note } = narrow(all, region || 'en', platform);
     const row = pickRow(rows, region, resolved || query, kind);
     if (!row) {
       if (old) return Object.assign({}, old.v, { stale: true, cachedAt: old.t });
@@ -666,7 +770,7 @@ window.TROVE_CONFIG = {
           : 'That barcode isn’t in any product database — type the title instead')
         : 'No market data found for “' + query + '” — try the exact title');
     }
-    const out = { row, rows, resolvedFrom: resolved };
+    const out = { row, rows, allRows: all, resolvedFrom: resolved, note, searchedAs: q };
     cachePut(key, out);
     return out;
   }
@@ -726,7 +830,7 @@ window.TROVE_CONFIG = {
     // Live market data. PriceCharting always; eBay asking prices too, once deployed.
     async refreshPrice(item) {
       let market = null;
-      try { market = await marketLookup(item.name, item.region, item.kind); }
+      try { market = await marketLookup(item.name, item.region, item.kind, item.platform); }
       catch (e) { if (!CFG.PRICES_ENDPOINT) throw e; }
       if (market) {
         const r = market.row;
@@ -742,8 +846,15 @@ window.TROVE_CONFIG = {
           if (r.console) it.pcConsole = r.console;
           it.pcUrl = r.url;
           it.marketSource = 'PriceCharting';
+          it.matchNote = market.note || null;
+          it.pcMatch = r.title + (r.console ? ' · ' + r.console : '');
           it.refreshedAt = Date.now();
-          it.history = (it.history || []).concat([{ t: Date.now(), buy: it.buy, sell: it.sell }]).slice(-60);
+          // Real samples only, one per day — the trend line has to be measured, not drawn.
+          const hist = (it.history || []).filter((h) => h && h.sell);
+          const last = hist[hist.length - 1];
+          if (!last || Date.now() - last.t > 20 * 3600e3) hist.push({ t: Date.now(), buy: it.buy, sell: it.sell });
+          else { last.sell = it.sell; last.buy = it.buy; last.t = Date.now(); }
+          it.history = hist.slice(-120);
         });
       }
       if (!CFG.PRICES_ENDPOINT) return { market: market && market.row };
@@ -830,23 +941,24 @@ window.TROVE_CONFIG = {
     },
 
     // Price anything by name without adding it to the catalog.
-    async quickLook(query, condition, region, kind) {
-      const m = await marketLookup(query, region, kind);   // real market data, no keys needed
+    async quickLook(query, condition, region, kind, platform) {
+      const m = await marketLookup(query, region, kind, platform);   // real market data, no keys needed
+      const meta = { note: m.note || null, alts: (m.rows || []).slice(0, 6), searchedAs: m.searchedAs, platform: platform || null, region: region || 'en' };
       if (!CFG.PRICES_ENDPOINT) {
         const r = m.row;
-        return { query, market: r, tiers: { loose: r.loose, cib: r.cib, sealed: r.sealed },
+        return Object.assign({ query, market: r, tiers: { loose: r.loose, cib: r.cib, sealed: r.sealed },
           soldMedian: condition === 'sealed' || condition === 'new' ? (r.sealed || r.cib || r.loose)
             : condition === 'cib' ? (r.cib || r.loose) : (r.loose || r.cib),
           image: r.image, pcUrl: r.url, listings: [], askUnknown: true, stale: m.stale, cachedAt: m.cachedAt,
-          resolvedFrom: m.resolvedFrom };
+          resolvedFrom: m.resolvedFrom }, meta);
       }
       const marketOnly = () => {
         const r = m.row;
-        return { query, market: r, tiers: { loose: r.loose, cib: r.cib, sealed: r.sealed },
+        return Object.assign({ query, market: r, tiers: { loose: r.loose, cib: r.cib, sealed: r.sealed },
           soldMedian: condition === 'sealed' ? (r.sealed || r.cib || r.loose)
             : condition === 'cib' ? (r.cib || r.loose) : (r.loose || r.cib),
           image: r.image, pcUrl: r.url, listings: [], askUnknown: true, stale: m.stale, cachedAt: m.cachedAt,
-          resolvedFrom: m.resolvedFrom };
+          resolvedFrom: m.resolvedFrom }, meta);
       };
       let res;
       try {
@@ -865,6 +977,7 @@ window.TROVE_CONFIG = {
       out.tiers = { loose: m.row.loose, cib: m.row.cib, sealed: m.row.sealed };
       if (!out.image) out.image = m.row.image;
       out.stale = m.stale; out.cachedAt = m.cachedAt; out.resolvedFrom = m.resolvedFrom;
+      Object.assign(out, meta);
       return out;
     },
 
@@ -980,19 +1093,23 @@ window.TROVE_CONFIG = {
     return { cls: 'stamp-over', label: Math.round(-d) + '% over market' };
   }
 
-  // Deterministic recent-sold comps around the market value, so the number has
-  // receipts behind it even before the live price service is switched on.
+  // ---------- real numbers only ----------
+  // Nothing here is invented: market value and the tiers come from PriceCharting,
+  // the trend is measured from readings this app actually stored, and everything
+  // else is arithmetic on top of those two with the assumptions spelled out.
   const SHIP = { game: 5, accessory: 6, handheld: 12, console: 18 };
   function ship(it) { return SHIP[it.kind] || 10; }
-  function velocity(it) {                       // est. sales per week
-    if (it.soldWk) return it.soldWk;
-    const h = hash(it.id);
-    const base = it.kind === 'game' ? 40 : it.kind === 'accessory' ? 30 : 18;
-    return Math.max(2, Math.round(base * (0.4 + (h % 100) / 60)));
+
+  function samples(it) {
+    return (it.history || []).filter((h) => h && h.sell > 0).sort((a, b) => a.t - b.t);
   }
-  function trendPct(it) {                       // 90-day market drift
-    const t = trend(it);
-    return ((t[11] - t[0]) / t[0]) * 100;
+  function histTrend(it) {
+    const h = samples(it);
+    if (h.length < 2) return null;
+    const first = h[0], last = h[h.length - 1];
+    if (!first.sell) return null;
+    const days = Math.max(1, Math.round((last.t - first.t) / 86400e3));
+    return { pct: ((last.sell - first.sell) / first.sell) * 100, days, n: h.length };
   }
   function targetMargin() { return st().settings.targetMargin || 30; }
   function maxBuy(it) {
@@ -1003,46 +1120,115 @@ window.TROVE_CONFIG = {
   function sellPlan(it) {
     const m = mv(it);
     const list = Math.round(m * 1.06);          // list a touch over median, expect offers
-    const net = fees(m) - ship(it);
-    const v = velocity(it);
-    const days = Math.max(1, Math.round(30 / Math.max(v / 4, 0.4)));
-    const t = trendPct(it);
-    const verdict = t > 4 ? { txt: 'Rising ' + Math.round(t) + '% — holding pays', cls: 'up' }
-      : t < -4 ? { txt: 'Falling ' + Math.round(-t) + '% — list it now', cls: 'down' }
-        : { txt: 'Flat market — sell whenever', cls: 'muted' };
-    return { list, net, v, days, t, verdict };
+    const fee = Math.round(m - fees(m));
+    const sh = ship(it);
+    const net = Math.round(fees(m) - sh);
+    const t = histTrend(it);
+    return { list, fee, ship: sh, net, t };
   }
 
-  function comps(it) {
-    const h = hash(it.id), out = [], m = mv(it);
-    const conds = ['sealed', 'cib', 'used', 'loose'];
-    for (let k = 0; k < 5; k++) {
-      const j = (((h >> (k * 3)) % 19) - 9) * (k % 2 ? -1 : 1);
-      out.push({
-        price: Math.max(1, Math.round(m * (1 + j / 100))),
-        days: 1 + ((h >> (k * 2)) % 11) + k * 4,
-        cond: k === 0 ? it.cond : conds[(h + k) % conds.length],
-        venue: k % 3 === 0 ? 'eBay' : k % 3 === 1 ? 'Mercari' : 'eBay',
-      });
-    }
-    return out.sort((a, b) => a.days - b.days);
-  }
-
-  function trend(it) {                                          // 12-step market curve for the equalizer
-    const h = hash(it.id), m = mv(it), out = [];
-    for (let k = 0; k < 12; k++) {
-      const drift = (k - 6) * ((h % 7) - 3) * 0.004;
-      const j = (((h >> k) % 11) - 5) / 100;
-      out.push(Math.max(1, m * (1 + drift + j)));
-    }
-    out[11] = m;
-    return out;
-  }
-
-  function eq(vals, dark) {
+  function spark(it) {
+    const h = samples(it);
+    if (h.length < 2) return '';
+    const vals = h.slice(-14).map((x) => x.sell);
     const lo = Math.min(...vals), hi = Math.max(...vals), span = hi - lo || 1;
-    return `<div class="eq ${dark ? 'eqd' : ''}">${vals.map((v, i) =>
+    return `<div class="eq eqd">${vals.map((v, i) =>
       `<i style="height:${Math.max(8, 14 + ((v - lo) / span) * 86)}%" class="${i === vals.length - 1 ? 'hi' : ''}"></i>`).join('')}</div>`;
+  }
+  function sparkBlock(it) {
+    const t = histTrend(it);
+    if (!t) {
+      return `<div style="margin-top:13px;position:relative;border:1px dashed rgba(255,255,255,.28);border-radius:16px;padding:10px 13px;font-size:11px;color:var(--accent-300)">
+        No trend yet — ${samples(it).length ? 'one reading stored' : 'no readings stored'}. Every refresh saves a real data point; the line appears on the second one.</div>`;
+    }
+    const up = t.pct >= 0;
+    return `<div style="margin-top:13px;position:relative">${spark(it)}
+      <div style="font-size:10.5px;margin-top:6px;color:${up ? 'var(--sage-300)' : 'var(--accent-300)'}">${up ? '+' : ''}${t.pct.toFixed(1)}% over ${t.days} day${t.days === 1 ? '' : 's'} · ${t.n} readings</div></div>`;
+  }
+
+  // ---------- the buy / sell flow ----------
+  // One picture of the whole decision: what it's worth, the most you can pay,
+  // what happens at the price you're looking at, and what you keep.
+  function flowNode(dot, inner) {
+    return `<div style="position:relative;margin-bottom:9px">
+      <span style="position:absolute;left:-25px;top:18px;width:14px;height:14px;border-radius:999px;background:${dot};box-shadow:0 0 0 4px var(--surface)"></span>
+      ${inner}</div>`;
+  }
+  function flowChart(it) {
+    const m = mv(it), mx = maxBuy(it), p = sellPlan(it), sh = ship(it);
+    const now = it.buy || 0;
+    const breakEven = Math.round(fees(m) - sh);
+    const mode = !now ? 'unknown' : now <= mx ? 'buy' : now <= breakEven ? 'thin' : 'pass';
+    const profit = now ? Math.round(p.net - now) : null;
+    const box = (bg, bd) => `background:${bg};border:1.5px solid ${bd};border-radius:20px;padding:12px 14px`;
+    const line = (a, b, strong) => `<div style="display:flex;align-items:baseline;gap:10px;margin-top:${strong ? 6 : 3}px">
+      <span style="flex:1;font-size:11.5px;color:var(--n-700)">${a}</span>
+      <b class="disp" style="font-size:${strong ? 19 : 14}px">${b}</b></div>`;
+
+    const verdict = mode === 'buy'
+      ? { t: 'Buy \u2014 ' + money(mx - now) + ' under your ceiling', c: 'var(--sage-800)', bg: 'var(--sage-100)', bd: 'var(--sage-300)' }
+      : mode === 'thin'
+        ? { t: 'Thin \u2014 profitable, but under your ' + targetMargin() + '% target', c: 'var(--accent-800)', bg: 'var(--accent-100)', bd: 'var(--accent-300)' }
+        : mode === 'pass'
+          ? { t: 'Pass \u2014 ' + money(now - breakEven) + ' past break-even', c: 'var(--accent-900)', bg: 'var(--accent-200)', bd: 'var(--accent-500)' }
+          : { t: 'No asking price yet \u2014 refresh, or type what you were quoted', c: 'var(--n-800)', bg: 'var(--n-200)', bd: 'var(--n-400)' };
+
+    return `<div style="position:relative;padding-left:25px;margin-top:6px">
+      <div style="position:absolute;left:6px;top:14px;bottom:22px;width:2px;background:var(--n-400)"></div>
+
+      ${flowNode('var(--n-700)', `<div style="${box('var(--n-100)', 'var(--n-400)')}">
+        <div class="kicker">Market value \u00b7 ${esc(condLabel(it.cond))}</div>
+        <div class="disp" style="font-size:26px;margin-top:2px">${money(m)}</div>
+        <div class="muted" style="font-size:10.5px">${it.pcMatch ? esc(it.pcMatch) : esc(it.marketSource || 'starter number \u2014 refresh for live data')}</div>
+      </div>`)}
+
+      ${flowNode('var(--accent)', `<div style="${box('var(--surface)', 'var(--accent-300)')}">
+        <div class="kicker">Work back to your ceiling</div>
+        ${line('Sell at market', money(m))}
+        ${line('Marketplace fees', '\u2212 ' + money(p.fee))}
+        ${line('Shipping estimate', '\u2212 ' + money(sh))}
+        ${line('Your ' + targetMargin() + '% margin', '\u2212 ' + money(Math.round((m * targetMargin()) / 100)))}
+        <div style="height:1px;background:var(--divider);margin:9px 0 3px"></div>
+        ${line('<b>Pay no more than</b>', money(mx), true)}
+      </div>`)}
+
+      ${flowNode(mode === 'buy' ? 'var(--sage-700)' : 'var(--accent-700)', `<div style="${box(verdict.bg, verdict.bd)}">
+        <div style="display:flex;align-items:flex-end;gap:12px">
+          <div><div class="kicker">Cheapest you have seen</div>
+            <div class="disp" style="font-size:22px">${now ? money(now) : '\u2014'}</div></div>
+          <div style="margin-left:auto;text-align:right;max-width:58%;font-size:11.5px;font-weight:700;color:${verdict.c}">${esc(verdict.t)}</div>
+        </div>
+      </div>`)}
+
+      ${flowNode('var(--sage-700)', `<div style="${box('var(--sage-100)', 'var(--sage-300)')}">
+        <div class="kicker">If you flip it</div>
+        ${line('List at', money(p.list))}
+        ${line('Fees + shipping', '\u2212 ' + money(p.fee + sh))}
+        ${line('You keep', money(p.net))}
+        ${now ? line('<b>Profit on this buy</b>', (profit >= 0 ? '' : '\u2212') + money(Math.abs(profit)), true) : ''}
+      </div>`)}
+    </div>`;
+  }
+
+  // ---------- deal hunting ----------
+  // Real searches built with eBay's own filters, aimed at what a picker wants:
+  // tested copies, under a number, before anyone else finds them.
+  function dealsBlock(it) {
+    const m = mv(it);
+    const links = D.dealLinks(it.name, {
+      region: it.region || 'en',
+      maxBuy: maxBuy(it),
+      cibCap: it.tiers && it.tiers.cib ? Math.round(it.tiers.cib * 0.85) : Math.round(m * 0.85),
+    });
+    return `<div class="card" style="padding:4px 15px">
+      ${links.map((l) => `<a class="linkrow" href="${esc(l.url)}" target="_blank" rel="noopener" style="border-top:1px solid var(--divider);align-items:flex-start;padding:11px 0">
+        <span style="flex:1">
+          <span style="display:block;font-size:12.5px;font-weight:700">${esc(l.name)}</span>
+          <span class="muted" style="display:block;font-size:10.5px;margin-top:2px">${esc(l.why)}</span>
+        </span>${svg(ICON.out, 14)}
+      </a>`).join('')}
+    </div>
+    <p class="muted" style="font-size:10.5px;margin:8px 2px 0">Each search drops parts / repair / repro / box-only listings, and \u2014 on US searches \u2014 Japanese and PAL copies.</p>`;
   }
 
   // ---------- haul (whole-pile) mode ----------
@@ -1281,8 +1467,8 @@ window.TROVE_CONFIG = {
   }
 
   // ---------- links ----------
-  const buyUrl = (it) => it.bestUrl || src(st().settings.venue || 'ebay').url(it.name);
-  const buyLabel = (it) => (it.bestUrl ? 'Buy ' + money(it.bestPrice || it.buy) : 'See listings ' + money(it.buy));
+  const buyUrl = (it) => it.bestUrl || D.dealLinks(it.name, { region: it.region || 'en', maxBuy: maxBuy(it) })[0].url;
+  const buyLabel = (it) => (it.bestUrl ? 'Buy ' + money(it.bestPrice || it.buy) : 'Hunt one under ' + money(maxBuy(it)));
 
   // ---------- filtering ----------
   function catalog() {
@@ -1454,7 +1640,7 @@ window.TROVE_CONFIG = {
             <div class="kicker">under</div>
           </div>
         </div>
-        <div style="margin-top:14px;position:relative">${eq(trend(hero), true)}</div>
+        <div style="margin-top:14px;position:relative">${sparkBlock(hero)}</div>
         <div style="display:flex;gap:9px;margin-top:14px;position:relative">
           <a class="btn" href="${buyUrl(hero)}" target="_blank" rel="noopener" style="flex:1;background:var(--accent-300);color:var(--accent-900);box-shadow:0 4px 0 rgba(32,30,29,.4)">${esc(buyLabel(hero))}</a>
           <button class="btn" data-open="${hero.id}" style="border:1px solid rgba(255,255,255,.3);color:var(--accent-100)">Details</button>
@@ -1657,7 +1843,6 @@ window.TROVE_CONFIG = {
     const it = (st().items || []).find((i) => i.id === ui.detail);
     if (!it) return '';
     const g = grade(it);
-    const cs = comps(it);
     const n = netOf(it);
     const w = (st().watch || {})[it.id];
     const listings = it.listings || [];
@@ -1675,6 +1860,14 @@ window.TROVE_CONFIG = {
           </div>
         </div>
       </div>
+      ${(() => {
+        const nt = it.matchNote || {};
+        const warn = nt.platformMiss ? 'No ' + platOf(it)[0] + ' release matched — this price is the closest other platform. Fix the platform and refresh.'
+          : nt.regionOnlyOther ? 'Only a foreign release exists for this title, so the price is for that version.'
+            : null;
+        return `${it.pcMatch ? `<div class="muted" style="font-size:11px;margin-top:9px">Priced as <b>${esc(it.pcMatch)}</b>${nt.droppedRegion ? ' · ' + nt.droppedRegion + ' foreign listing' + (nt.droppedRegion === 1 ? '' : 's') + ' ignored' : ''}</div>` : ''}
+        ${warn ? `<div style="margin-top:10px;border:1.5px solid var(--accent-500);background:var(--accent-100);border-radius:20px;padding:11px 14px;font-size:11.5px;font-weight:600;color:var(--accent-900)">${esc(warn)}</div>` : ''}`;
+      })()}
 
       <div class="cab" style="margin-top:14px">
         <span class="scan"></span>
@@ -1682,7 +1875,7 @@ window.TROVE_CONFIG = {
           <div>
             <div class="kicker">Market value</div>
             <div class="disp" style="font-size:30px">${money(mv(it))}</div>
-            <div style="font-size:10.5px;color:var(--accent-300)">${it.refreshedAt ? (it.estimated ? 'live asking median' : 'live sold median') : 'recent sold median'}${it.liveCount ? ' · ' + it.liveCount + ' listings' : ''}</div>
+            <div style="font-size:10.5px;color:var(--accent-300)">${it.refreshedAt ? (it.estimated ? 'live asking median' : 'PriceCharting sold median') : 'starter number — refresh for live data'}${it.liveCount ? ' · ' + it.liveCount + ' listings' : ''}</div>
           </div>
           <div style="margin-left:auto;text-align:right">
             <div class="kicker">Best price now</div>
@@ -1690,7 +1883,7 @@ window.TROVE_CONFIG = {
             <div class="stamp ${g.cls}" style="margin-top:6px">${esc(g.label)}</div>
           </div>
         </div>
-        <div style="margin-top:14px;position:relative">${eq(trend(it), true)}</div>
+        ${sparkBlock(it)}
         ${it.tiers ? `<div style="display:flex;gap:8px;margin-top:13px;position:relative">
           <div class="stat"><b>${money(it.tiers.loose)}</b><span>Loose</span></div>
           <div class="stat"><b>${money(it.tiers.cib)}</b><span>CIB</span></div>
@@ -1703,51 +1896,30 @@ window.TROVE_CONFIG = {
           </div>
           <div style="text-align:right;font-size:10.5px;color:var(--accent-300);max-width:44%">to clear ${targetMargin()}% after fees and ${money(ship(it))} shipping</div>
         </div>
-        <div style="display:flex;gap:8px;margin-top:12px;position:relative">
-          <div class="stat"><b>${money(Math.min(...cs.map((c) => c.price)))}–${money(Math.max(...cs.map((c) => c.price)))}</b><span>Sold range</span></div>
-          <div class="stat"><b style="color:${n.net >= 0 ? 'var(--sage-300)' : 'var(--accent-300)'}">${money(n.net)}</b><span>Net if flipped</span></div>
-          <div class="stat"><b>${Math.round(n.pct)}%</b><span>Return</span></div>
-        </div>
       </div>
+
+      <h4 style="margin:20px 0 4px">Buy or pass</h4>
+      <p class="muted" style="font-size:11.5px;margin:0 0 4px">Every number below is market value with fees, shipping and your margin taken off it — no estimates.</p>
+      ${flowChart(it)}
 
       ${(() => { const p = sellPlan(it); return `<div class="cab cab-sage" style="margin-top:12px">
         <span class="scan"></span><span class="glow"></span>
-        <div style="display:flex;align-items:flex-end;gap:16px;position:relative">
-          <div>
-            <div class="kicker">List it at</div>
-            <div class="disp" style="font-size:28px">${money(p.list)}</div>
-            <div style="font-size:10.5px;color:var(--sage-300)">a touch over median, room for offers</div>
-          </div>
-          <div style="margin-left:auto;text-align:right">
-            <div class="kicker">You keep</div>
-            <div class="disp" style="font-size:22px">${money(p.net)}</div>
-            <div style="font-size:10.5px;color:var(--sage-300)">after fees + ${money(ship(it))} ship</div>
-          </div>
-        </div>
-        <div style="display:flex;gap:8px;margin-top:13px;position:relative">
-          <div class="stat"><b>${p.v}/wk</b><span>Sell rate</span></div>
-          <div class="stat"><b>~${p.days}d</b><span>To sell</span></div>
-          <div class="stat"><b>${p.t >= 0 ? '+' : ''}${Math.round(p.t)}%</b><span>90-day trend</span></div>
-        </div>
-        <div style="margin-top:12px;font-size:12px;font-weight:700;position:relative;color:${p.t > 4 ? 'var(--sage-300)' : p.t < -4 ? 'var(--accent-300)' : 'rgba(255,255,255,.75)'}">${esc(p.verdict.txt)}</div>
-        <div style="display:flex;gap:9px;margin-top:13px;position:relative">
+        <div style="position:relative;font-size:12px;font-weight:700;color:${p.t && p.t.pct > 4 ? 'var(--sage-300)' : p.t && p.t.pct < -4 ? 'var(--accent-300)' : 'rgba(255,255,255,.8)'}">${p.t
+          ? (p.t.pct > 4 ? 'Up ' + p.t.pct.toFixed(1) + '% across ' + p.t.n + ' readings — holding has paid'
+            : p.t.pct < -4 ? 'Down ' + Math.abs(p.t.pct).toFixed(1) + '% across ' + p.t.n + ' readings — list it'
+              : 'Flat across ' + p.t.n + ' readings')
+          : 'Refresh a few times and a measured trend appears here — nothing is guessed.'}</div>
+        <div style="display:flex;gap:9px;margin-top:12px;position:relative">
           <button class="btn" data-copytitle="${it.id}" style="flex:1;background:rgba(255,255,255,.16);color:var(--sage-100);border:0">Copy listing title</button>
-          <a class="btn" href="https://www.ebay.com/sl/sell" target="_blank" rel="noopener" style="background:var(--sage-300);color:var(--sage-800)">Sell on eBay</a>
+          <a class="btn" href="https://www.ebay.com/sl/sell" target="_blank" rel="noopener" style="background:var(--sage-300);color:var(--sage-800)">List on eBay</a>
         </div>
       </div>`; })()}
 
-      <h4 style="margin:20px 0 6px">Recently sold</h4>
-      <div class="card" style="padding:6px 15px">
-        ${cs.map((c) => `<div class="sold">
-          <div class="disp" style="font-size:16px;width:74px">${money(c.price)}</div>
-          <div style="flex:1;min-width:0"><div style="font-size:11.5px;font-weight:600">${esc(condLabel(c.cond))}</div>
-          <div class="muted" style="font-size:10px">${esc(c.venue)}</div></div>
-          <div class="muted" style="font-size:10.5px">${c.days}d ago</div>
-        </div>`).join('')}
-      </div>
+      <h4 style="margin:22px 0 6px">Find one cheap</h4>
+      ${dealsBlock(it)}
       <div style="display:flex;gap:8px;margin-top:10px">
-        <a class="btn btn-secondary" href="${D.soldComps(it.name)}" target="_blank" rel="noopener" style="flex:1;font-size:12.5px">All sold comps ${svg(ICON.out, 13)}</a>
-        <a class="btn btn-secondary" href="${D.priceCharting(it.name)}" target="_blank" rel="noopener" style="flex:1;font-size:12.5px">PriceCharting ${svg(ICON.out, 13)}</a>
+        <a class="btn btn-secondary" href="${D.soldCompsCond(it.name, it.region, it.cond)}" target="_blank" rel="noopener" style="flex:1;font-size:12.5px">What it sold for ${svg(ICON.out, 13)}</a>
+        <a class="btn btn-secondary" href="${it.pcUrl || D.priceCharting(it.name)}" target="_blank" rel="noopener" style="flex:1;font-size:12.5px">Price history ${svg(ICON.out, 13)}</a>
       </div>
 
       ${listings.length ? `<h4 style="margin:22px 0 8px">Cheapest right now ${it.estimated ? '' : ''}</h4>
@@ -2082,13 +2254,32 @@ window.TROVE_CONFIG = {
           <option value="cib">Complete in box</option><option value="sealed">Sealed</option>
         </select>
         <select class="in" id="quickRegion" style="flex:1">
-          <option value="en">US / English</option><option value="jp">Japanese</option>
+          <option value="en" ${(ui.quickRegion || 'en') === 'en' ? 'selected' : ''}>US / English</option>
+          <option value="jp" ${ui.quickRegion === 'jp' ? 'selected' : ''}>Japanese</option>
+          <option value="pal" ${ui.quickRegion === 'pal' ? 'selected' : ''}>PAL / EU</option>
         </select>
       </div>
+      <div style="margin-top:9px">
+        <select class="in" id="quickPlat">
+          <option value="">Any console — less accurate</option>
+          ${Object.keys(D.PLATFORMS).filter((p) => p !== 'multi').map((p) =>
+            `<option value="${p}" ${ui.quickPlat === p ? 'selected' : ''}>${esc(D.PLATFORMS[p][0])}</option>`).join('')}
+        </select>
+      </div>
+      <p class="muted" style="font-size:10.5px;margin:7px 2px 0">Naming the console is what keeps a US N64 search from coming back with the Japanese release.</p>
       ${r ? (() => {
-        const fake = { id: 'quick', name: (r.market && r.market.title) || r.query, kind: 'game', cond: ui.quickCond || 'used', sell: r.soldMedian || 0 };
-        const mx = maxBuy(fake);
-        return `<div class="cab" style="margin-top:14px">
+        const subj = { id: 'quick', name: (r.market && r.market.title) || r.query, kind: ui.quickKind || 'game',
+          cond: ui.quickCond || 'used', region: ui.quickRegion || 'en', sell: r.soldMedian || 0,
+          tiers: r.tiers || null, buy: Math.round(r.lowestBuy || 0), pcMatch: r.market ? r.market.title + (r.market.console ? ' · ' + r.market.console : '') : null };
+        const mx = maxBuy(subj);
+        const note = r.note || {};
+        const warn = note.platformMiss
+          ? 'Nothing on ' + ((D.PLATFORMS[ui.quickPlat] || ['that console'])[0]) + ' matched — this is the closest release on another platform. Check the console line.'
+          : note.regionOnlyOther
+            ? 'This title only exists as a ' + ((r.market && r.market.console) || 'foreign') + ' release — the number is for that version.'
+            : null;
+        return `${warn ? `<div style="margin-top:13px;border:1.5px solid var(--accent-500);background:var(--accent-100);border-radius:20px;padding:11px 14px;font-size:11.5px;color:var(--accent-900);font-weight:600">${esc(warn)}</div>` : ''}
+      <div class="cab" style="margin-top:14px">
         <span class="scan"></span><span class="glow"></span>
         <div style="position:relative">
           <div style="display:flex;align-items:center;gap:12px">
@@ -2109,15 +2300,26 @@ window.TROVE_CONFIG = {
             <div class="stat"><b>${money(r.tiers.sealed)}</b><span>Sealed</span></div>
           </div>` : ''}
           ${(r.listings || []).length ? `<a class="btn" href="${esc(r.listings[0].url)}" target="_blank" rel="noopener" style="margin-top:13px;width:100%;background:var(--accent-300);color:var(--accent-900)">Open the cheapest listing ${money(r.lowestBuy)}</a>`
-            : `<a class="btn" href="${src('ebay').url((r.market && r.market.title) || r.query)}" target="_blank" rel="noopener" style="margin-top:13px;width:100%;background:var(--accent-300);color:var(--accent-900)">Find one on eBay</a>`}
+            : `<a class="btn" href="${esc(D.dealLinks(subj.name, { region: subj.region, maxBuy: mx })[0].url)}" target="_blank" rel="noopener" style="margin-top:13px;width:100%;background:var(--accent-300);color:var(--accent-900)">Tested &amp; working under ${money(mx)}</a>`}
         </div>
       </div>
-      <div style="display:flex;gap:8px;margin-top:10px">
+      <h4 style="margin:18px 0 6px">Buy or pass</h4>
+      ${flowChart(subj)}
+      <h4 style="margin:18px 0 6px">Find one cheap</h4>
+      ${dealsBlock(subj)}
+      ${(r.alts || []).length > 1 ? `<h4 style="margin:18px 0 6px">Not the right one?</h4>
+      <div class="card" style="padding:4px 15px">
+        ${r.alts.map((a) => `<a class="linkrow" href="${esc(a.url || D.priceCharting(a.title))}" target="_blank" rel="noopener" style="border-top:1px solid var(--divider)">
+          <span style="flex:1;min-width:0"><span class="ellip" style="display:block;font-size:12.5px;font-weight:600">${esc(a.title)}</span>
+          <span class="muted" style="font-size:10.5px">${esc(a.console || '')} · loose ${money(a.loose)} · CIB ${money(a.cib)}</span></span>${svg(ICON.out, 13)}
+        </a>`).join('')}
+      </div>` : ''}
+      <div style="display:flex;gap:8px;margin-top:12px">
         <button class="btn btn-sage" data-quickadd="1" style="flex:1">Track this</button>
-        <a class="btn btn-secondary" href="${D.soldComps((r.market && r.market.title) || r.query)}" target="_blank" rel="noopener">Sold comps</a>
+        <a class="btn btn-secondary" href="${D.soldCompsCond(subj.name, subj.region, subj.cond)}" target="_blank" rel="noopener">Sold for</a>
       </div>`; })()
       : `<div style="margin-top:14px;display:flex;gap:8px">
-          <a class="btn btn-secondary" href="${D.soldComps(ui.quickQ || 'retro game')}" target="_blank" rel="noopener" style="flex:1;font-size:12.5px">Sold comps ${svg(ICON.out, 13)}</a>
+          <a class="btn btn-secondary" href="${D.soldComps(ui.quickQ || 'retro game', ui.quickRegion)}" target="_blank" rel="noopener" style="flex:1;font-size:12.5px">Sold comps ${svg(ICON.out, 13)}</a>
           <a class="btn btn-secondary" href="${D.priceCharting(ui.quickQ || 'retro game')}" target="_blank" rel="noopener" style="flex:1;font-size:12.5px">PriceCharting ${svg(ICON.out, 13)}</a>
         </div>`}`,
       [`<button class="btn btn-secondary" data-close="1" style="flex:1">Done</button>`]);
@@ -2397,7 +2599,8 @@ window.TROVE_CONFIG = {
         ui.quickCond = ($('quickCond') || {}).value || 'used';
         ui.quickRegion = ($('quickRegion') || {}).value || 'en';
         ui.quickKind = ($('quickKind') || {}).value || 'game';
-        ui.quick = await S.quickLook(q, ui.quickCond, ui.quickRegion, ui.quickKind);
+        ui.quickPlat = ($('quickPlat') || {}).value || '';
+        ui.quick = await S.quickLook(q, ui.quickCond, ui.quickRegion, ui.quickKind, ui.quickPlat || null);
         render();
       }
       catch (err) { ui.quick = null; render(); toast(err.message); }
@@ -2487,7 +2690,7 @@ window.TROVE_CONFIG = {
       const r = ui.quick, id = uid();
       const sell = Math.round(r.soldMedian || 0);
       S.update((s) => {
-        s.items.unshift({ id, name: (r.market && r.market.title) || r.query, kind: ui.quickKind || 'game', platform: 'multi',
+        s.items.unshift({ id, name: (r.market && r.market.title) || r.query, kind: ui.quickKind || 'game', platform: ui.quickPlat || 'multi',
           era: 'retro', cond: ui.quickCond || 'used', region: ui.quickRegion || 'en',
           buy: Math.round(r.lowestBuy || 0), sell, tiers: r.tiers || null,
           autoImage: r.image || null, pcUrl: r.pcUrl || null, marketSource: 'PriceCharting',
@@ -2666,6 +2869,7 @@ window.TROVE_CONFIG = {
     if (e.target.id === 'quickCond') { ui.quickCond = e.target.value; }
     if (e.target.id === 'quickKind') { ui.quickKind = e.target.value; }
     if (e.target.id === 'quickRegion') { ui.quickRegion = e.target.value; }
+    if (e.target.id === 'quickPlat') { ui.quickPlat = e.target.value; }
   });
 
   document.addEventListener('keydown', (e) => {

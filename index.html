@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Trove — market value, steals &amp; sell prices</title>
+<title>Trove — know what it's worth before you pay</title>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
@@ -111,6 +111,7 @@ input.in,select.in{width:100%;min-height:46px;padding:8px 16px;background:var(--
 .ellip{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .muted{color:var(--n-600)}
 .up{color:var(--sage-700)} .down{color:var(--accent-700)}
+.fdot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:4px;vertical-align:1px}
 
 .art{flex:none;border-radius:14px;overflow:hidden;position:relative;display:grid;place-items:center;background:var(--n-300)}
 .art img{width:100%;height:100%;object-fit:cover;display:block;box-sizing:border-box}
@@ -145,7 +146,7 @@ input.in,select.in{width:100%;min-height:46px;padding:8px 16px;background:var(--
 @keyframes up{from{transform:translateY(100%)}to{transform:translateY(0)}}
 @keyframes fade{from{opacity:0}to{opacity:1}}
 .screen{animation:fade .16s ease-out}
-.toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(96px + var(--safe-bot));z-index:80;
+.toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(96px + var(--safe-bot));z-index:90;
   background:rgba(32,30,29,.93);color:var(--n-100);padding:11px 18px;border-radius:999px;font-size:13px;box-shadow:var(--shadow-lg);max-width:88%;text-align:center}
 .stat{flex:1;background:var(--bg);border-radius:16px;padding:10px 11px}
 .stat b{font-family:var(--font-h);font-weight:400;font-size:18px;display:block;line-height:1.15}
@@ -173,6 +174,7 @@ input.in,select.in{width:100%;min-height:46px;padding:8px 16px;background:var(--
   <nav class="tabs" id="tabs"></nav>
 </div>
 <div id="overlay"></div>
+<div id="toastHost"></div>
 <script>
 // Trove configuration.
 // Tier 0 works with no keys at all (local data on the phone).
@@ -184,8 +186,9 @@ window.TROVE_CONFIG = {
   // --- Live eBay prices (Supabase Edge Function; see README "Live prices") ---
   PRICES_ENDPOINT: 'https://mqmwakroingacbgbsfzw.supabase.co/functions/v1/prices',
 
-  // How often the app quietly re-checks a price it already has (hours)
-  REFRESH_HOURS: 12,
+  // Default for how old a price may get before Trove re-checks it on its own (hours).
+  // Each phone can change this on the You tab.
+  REFRESH_HOURS: 6,
 
   // Marketplace fee assumptions used for net math
   FEES: { ebay: 0.1325, mercari: 0.10, whatnot: 0.08, local: 0 },
@@ -195,7 +198,8 @@ window.TROVE_CONFIG = {
 </script>
 <script>
 // Catalog seed + real marketplace link builders.
-// `buy` = best asking price we know of right now. `sell` = recent sold median (market value).
+// The seed `buy` / `sell` numbers are only starter estimates. Trove treats them as
+// unverified and replaces them with live data automatically the first time it runs.
 (function () {
   const q = encodeURIComponent;
 
@@ -295,9 +299,9 @@ window.TROVE_CONFIG = {
     fpga: ['FPGA', '#c67139', '#fff2eb'],
     multi: ['Multi', '#82796a', '#f9f4ed'],
   };
+  const CURRENT_PLATFORMS = ['switch2', 'switch', 'ps5', 'xsx', 'pcwin', 'fpga'];
 
   // Starting catalog — hardware and games, retro and current.
-  // Prices are a well-researched starting point; refresh or edit them in the app.
   const SEED = [
     // ---- current handhelds & consoles ----
     { id: 'switch2', name: 'Nintendo Switch 2', kind: 'console', platform: 'switch2', era: 'current', cond: 'new', buy: 449, sell: 512 },
@@ -406,13 +410,13 @@ window.TROVE_CONFIG = {
     neogeo: ['neo geo'], pcwin: ['pc games'], fpga: [], multi: [],
   };
 
-  window.TroveData = { SOURCES, SEED, KINDS, CONDS, ERAS, PLATFORMS, PC_CONSOLE,
+  window.TroveData = { SOURCES, SEED, KINDS, CONDS, ERAS, PLATFORMS, PC_CONSOLE, CURRENT_PLATFORMS,
     soldComps, soldCompsCond, priceCharting, dealLinks };
 })();
 
 </script>
 <script>
-// Local-first store with optional Supabase sync.
+// Local-first store with optional Supabase sync, plus the live price engine.
 // Data shape is one JSON document per household, so two phones stay in step
 // without a schema migration every time the app grows.
 (function () {
@@ -425,11 +429,12 @@ window.TROVE_CONFIG = {
     householdName: 'My household',
     inviteCode: null,
     members: [{ id: 'me', name: 'Me', initials: 'ME' }],
-    items: window.TroveData.SEED.map((s) => ({ ...s, history: [{ t: Date.now(), buy: s.buy, sell: s.sell }] })),
+    // Seed prices carry no history: a trend is only ever drawn from real readings.
+    items: window.TroveData.SEED.map((s) => ({ ...s, history: [] })),
     watch: {},          // itemId -> { target, by }
     flips: [],          // { id, itemId, name, buy, sell, ship, venue, cond, when, by }
     messages: [],       // { id, by, text, itemId, t } — private to the household
-    settings: { fees: true, minMargin: 10, venue: 'ebay', sort: 'margin' },
+    settings: { fees: true, minMargin: 10, venue: 'ebay', sort: 'margin', autoRefresh: true, refreshHours: CFG.REFRESH_HOURS || 6 },
     updatedAt: Date.now(),
   });
 
@@ -439,17 +444,26 @@ window.TROVE_CONFIG = {
     const base = freshState();
     const out = Object.assign({}, base, x || {});
     if (!Array.isArray(out.items) || !out.items.length) out.items = base.items;
-    out.items = out.items.filter(Boolean).map((i) => Object.assign({
-      id: 'i' + Math.random().toString(36).slice(2, 8), name: 'Untitled', kind: 'handheld',
-      cond: 'used', buy: 0, sell: 0, history: [],
-    }, i));
+    out.items = out.items.filter(Boolean).map((i) => {
+      const it = Object.assign({
+        id: 'i' + Math.random().toString(36).slice(2, 8), name: 'Untitled', kind: 'handheld',
+        cond: 'used', buy: 0, sell: 0, history: [],
+      }, i);
+      // Never-refreshed items only hold starter guesses — drop the fake first sample.
+      if (!it.refreshedAt) it.history = [];
+      // Older builds stored live eBay asks without marking them as live.
+      if (it.refreshedAt && !it.askAt && Array.isArray(it.listings) && it.listings.length) {
+        it.askAt = it.refreshedAt; it.askSrc = 'ebay';
+      }
+      return it;
+    });
     // New catalog entries from a newer build get folded in, and seeded items keep
     // their platform/era metadata up to date — without touching user edits.
     const byId = {};
     out.items.forEach((i) => { byId[i.id] = i; });
     window.TroveData.SEED.forEach((seed) => {
       const existing = byId[seed.id];
-      if (!existing) out.items.push(Object.assign({}, seed, { history: [{ t: Date.now(), buy: seed.buy, sell: seed.sell }] }));
+      if (!existing) out.items.push(Object.assign({}, seed, { history: [] }));
       else {
         if (!existing.platform) existing.platform = seed.platform;
         if (!existing.era) existing.era = seed.era;
@@ -478,26 +492,33 @@ window.TROVE_CONFIG = {
     return freshState();
   }
 
-  let batching = 0, batchDirty = false;
-  function emit() {
-    if (batching) { batchDirty = true; return; }
-    listeners.forEach((fn) => fn(state));
-  }
-  async function batch(fn) {
-    batching++;
-    try { return await fn(); }
-    finally {
-      batching--;
-      if (!batching && batchDirty) { batchDirty = false; emit(); }
-    }
-  }
+  // ---------- saving ----------
+  // Things the person does save and repaint at once. Background price work is
+  // grouped: it saves, repaints and syncs in small batches instead of per item.
+  const emit = () => listeners.forEach((fn) => fn(state));
+  const saveLocal = () => { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {} };
+  let bgDepth = 0, dirty = false;
 
-  function persist(push = true) {
+  function commit(push) {
+    dirty = false;
     state.updatedAt = Date.now();
-    try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
+    saveLocal();
     emit();
     if (push && supa && householdId) pushRemote();
   }
+  function persist(push = true) { commit(push); }
+  function persistBg() {
+    state.updatedAt = Date.now();
+    if (bgDepth) { dirty = true; return; }
+    commit(true);
+  }
+  function flush() { if (dirty) commit(true); }
+  async function batch(fn) {
+    bgDepth++;
+    try { return await fn(); }
+    finally { bgDepth--; if (!bgDepth) flush(); }
+  }
+  function bgUpdate(mutator) { mutator(state); persistBg(); }
 
   // ---------- Supabase (optional) ----------
   async function initCloud() {
@@ -544,7 +565,12 @@ window.TROVE_CONFIG = {
     const out = normalize(remote);
     const byId = (arr) => { const m = {}; (arr || []).forEach((x) => { if (x && x.id) m[x.id] = x; }); return m; };
     const rItems = byId(out.items);
-    (local.items || []).forEach((i) => { if (!rItems[i.id]) out.items.push(i); });
+    (local.items || []).forEach((i) => {
+      const r = rItems[i.id];
+      if (!r) out.items.push(i);
+      // Keep whichever phone holds the newer price for the same item.
+      else if ((i.refreshedAt || 0) > (r.refreshedAt || 0)) Object.assign(r, i);
+    });
     const rFlips = byId(out.flips);
     (local.flips || []).forEach((f) => { if (!rFlips[f.id]) out.flips.push(f); });
     const rMsgs = byId(out.messages);
@@ -561,7 +587,7 @@ window.TROVE_CONFIG = {
     if (data.data && (adopt || data.data.updatedAt > (state.updatedAt || 0))) {
       const merged = adopt ? mergeStates(data.data, state) : normalize(data.data);
       state = normalize(Object.assign({}, merged, { inviteCode: data.code, householdName: data.name }));
-      try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
+      saveLocal();
       emit();
       if (adopt) pushRemote();
     } else {
@@ -576,7 +602,7 @@ window.TROVE_CONFIG = {
     pushTimer = setTimeout(async () => {
       try { await supa.from('households').update({ data: state, updated_at: new Date().toISOString() }).eq('id', householdId); }
       catch (e) {}
-    }, 700);
+    }, 900);
   }
 
   function subscribe() {
@@ -589,16 +615,14 @@ window.TROVE_CONFIG = {
             // A push from the other phone must not wipe anything this phone has added
             // since — fold, don't replace.
             state = mergeStates(remote, state);
-            try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
+            saveLocal();
             emit();
           }
         })
       .subscribe();
   }
 
-  // ---------- Keyless market data (works today, no API keys) ----------
-  // PriceCharting publishes loose / CIB / new medians for retro and current games
-  // and hardware. We read it through a public CORS proxy.
+  // ---------- Keyless market data (PriceCharting through a CORS proxy) ----------
   const PROXIES = [
     (u) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
     (u) => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(u),
@@ -606,37 +630,66 @@ window.TROVE_CONFIG = {
     (u) => 'https://api.cors.lol/?url=' + encodeURIComponent(u),
     (u) => 'https://proxy.cors.sh/' + u,
   ];
+  const PROXY_KEY = 'trove.proxy';
+  let bestProxy = (() => {
+    const n = parseInt(localStorage.getItem(PROXY_KEY) || '0', 10);
+    return n >= 0 && n < PROXIES.length ? n : 0;
+  })();
 
-  // Lookups are cached for six hours so a public proxy never gets hammered.
+  // Lookups are cached so a public proxy never gets hammered; a stale copy is kept
+  // as a fallback for bad signal at a flea market.
   const MKT_KEY = 'trove.market.v1';
+  const MKT_TTL = 3 * 3600e3;
   const mktCache = (() => { try { return JSON.parse(localStorage.getItem(MKT_KEY) || '{}'); } catch (e) { return {}; } })();
   const cacheGet = (k) => {
     const hit = mktCache[k];
-    return hit && Date.now() - hit.t < 6 * 3600e3 ? hit.v : null;
+    return hit && Date.now() - hit.t < MKT_TTL ? hit.v : null;
   };
-  const cacheAny = (k) => mktCache[k] || null;   // bad signal at a flea market: any age beats nothing
+  const cacheAny = (k) => mktCache[k] || null;
+  let cacheSaveT = null;
   const cachePut = (k, v) => {
     mktCache[k] = { t: Date.now(), v };
     const keys = Object.keys(mktCache);
     if (keys.length > 400) delete mktCache[keys[0]];
-    try { localStorage.setItem(MKT_KEY, JSON.stringify(mktCache)); } catch (e) {}
+    clearTimeout(cacheSaveT);
+    cacheSaveT = setTimeout(() => { try { localStorage.setItem(MKT_KEY, JSON.stringify(mktCache)); } catch (e) {} }, 400);
   };
 
+  // Hedged requests: the proxy that answered last time goes first. If it hasn't
+  // answered within 1.2 s the next one joins the race, and so on. The first good
+  // answer wins and every other request is cancelled. Worst case drops from
+  // two full sequential passes (~2 min) to about 14 s.
   async function viaProxy(url, ms) {
-    let lastErr;
-    for (let pass = 0; pass < 2; pass++) {
-      for (const wrap of PROXIES) {
+    const limit = ms || 9000;
+    const order = [bestProxy].concat(PROXIES.map((_, i) => i).filter((i) => i !== bestProxy));
+    const ctls = [], timers = [];
+    let finished = false;
+    const attempt = (i, wait) => new Promise((resolve, reject) => {
+      timers.push(setTimeout(async () => {
+        if (finished) return reject(new Error('cancelled'));
+        const c = new AbortController(); ctls.push(c);
+        const kill = setTimeout(() => c.abort(), limit);
         try {
-          const res = await fetch(wrap(url), { signal: AbortSignal.timeout(ms || 12000) });
-          if (!res.ok) { lastErr = new Error('proxy ' + res.status); continue; }
+          const res = await fetch(PROXIES[i](url), { signal: c.signal });
+          if (!res.ok) throw new Error('proxy ' + res.status);
           const text = await res.text();
-          if (text.length > 2000) return text;
-          lastErr = new Error('empty response');
-        } catch (e) { lastErr = e; }
-      }
-      if (pass === 0) await new Promise((r) => setTimeout(r, 1200));
+          if (text.length < 2000) throw new Error('empty response');
+          resolve({ text, i });
+        } catch (e) { reject(e); }
+        finally { clearTimeout(kill); }
+      }, wait));
+    });
+    try {
+      const win = await Promise.any(order.map((i, k) => attempt(i, k * 1200)));
+      if (win.i !== bestProxy) { bestProxy = win.i; try { localStorage.setItem(PROXY_KEY, String(win.i)); } catch (e) {} }
+      return win.text;
+    } catch (e) {
+      throw new Error('Could not reach the price source just now — check your signal and try again');
+    } finally {
+      finished = true;
+      timers.forEach(clearTimeout);
+      ctls.forEach((c) => { try { c.abort(); } catch (e) {} });
     }
-    throw new Error('Could not reach the price source just now — try again in a moment');
   }
 
   const num = (s2) => parseFloat(String(s2).replace(/[^0-9.]/g, '')) || 0;
@@ -662,9 +715,6 @@ window.TROVE_CONFIG = {
   }
 
   const tokens = (s2) => String(s2).toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter((w) => w.length > 1);
-
-  // Rank candidates against what the user actually typed, so "Nintendo 64"
-  // returns the console and not the best-selling game on it.
   const isUpc = (q) => /^\d{8,14}$/.test(String(q).trim());
 
   // PriceCharting prefixes foreign releases: "JP Nintendo 64", "PAL Gamecube".
@@ -673,8 +723,7 @@ window.TROVE_CONFIG = {
   const bareConsole = (r) => String(r.console || '').toLowerCase().replace(/^\s*(jp|pal|japan)\s+/i, '').trim();
   const pcNames = (platform) => ((window.TroveData && window.TroveData.PC_CONSOLE) || {})[platform] || [];
 
-  // Region and platform are hard constraints, not hints — asking for an English N64
-  // game and getting the Japanese release back is the bug this exists to prevent.
+  // Region and platform are hard constraints, not hints.
   function narrow(rows, region, platform) {
     const note = { droppedRegion: 0, droppedPlatform: 0, regionOnlyOther: false, platformMiss: false };
     let out = rows;
@@ -698,6 +747,8 @@ window.TROVE_CONFIG = {
     return { rows: out, note };
   }
 
+  // Rank candidates against what the user actually typed, so "Nintendo 64"
+  // returns the console and not the best-selling game on it.
   function pickRow(rows, region, query, kind) {
     if (!rows.length) return null;
     if (isUpc(query)) return rows[0];
@@ -717,7 +768,11 @@ window.TROVE_CONFIG = {
   }
 
   // A barcode means nothing to a price database — turn it into a product title first.
+  // Barcode → title never changes, so it is cached for good.
   async function upcTitle(code) {
+    const ck = 'upc|' + code;
+    const known = cacheAny(ck);
+    if (known && known.v) return known.v;
     const url = 'https://api.upcitemdb.com/prod/trial/lookup?upc=' + encodeURIComponent(code);
     const parse = (txt) => {
       try {
@@ -726,17 +781,28 @@ window.TROVE_CONFIG = {
         return (it && (it.title || it.brand)) || null;
       } catch (e) { return null; }
     };
+    let t = null;
     try {
       const res = await fetch(url, { signal: AbortSignal.timeout(9000) });
-      if (res.ok) { const t = parse(await res.text()); if (t) return t; }
+      if (res.ok) t = parse(await res.text());
     } catch (e) {}
-    try { return parse(await viaProxy(url, 9000)); } catch (e) { return null; }
+    if (!t) { try { t = parse(await viaProxy(url, 9000)); } catch (e) { t = null; } }
+    if (t) cachePut(ck, t);
+    return t;
   }
 
-  async function marketLookup(query, region, kind, platform) {
-    const key = (region || 'en') + '|' + (kind || '') + '|' + (platform || '') + '|' + query.toLowerCase().trim();
-    const hit = cacheGet(key);
-    if (hit) return hit;
+  // Which tier a condition sells at.
+  function pickTier(r, cond, era) {
+    if (!r) return 0;
+    return cond === 'sealed' ? (r.sealed || r.cib || r.loose)
+      : cond === 'new' ? (era === 'current' ? (r.cib || r.loose) : (r.sealed || r.cib || r.loose))
+        : cond === 'cib' ? (r.cib || r.loose) : (r.loose || r.cib);
+  }
+
+  const mkey = (query, region, kind, platform) =>
+    (region || 'en') + '|' + (kind || '') + '|' + (platform || '') + '|' + String(query).toLowerCase().trim();
+
+  async function doLookup(key, query, region, kind, platform) {
     let q = query, resolved = null;
     if (isUpc(q)) {
       resolved = await upcTitle(q);
@@ -770,10 +836,58 @@ window.TROVE_CONFIG = {
           : 'That barcode isn’t in any product database — type the title instead')
         : 'No market data found for “' + query + '” — try the exact title');
     }
-    const out = { row, rows, allRows: all, resolvedFrom: resolved, note, searchedAs: q };
+    const out = { row, rows: rows.slice(0, 8), resolvedFrom: resolved, note, searchedAs: q };
     cachePut(key, out);
     return out;
   }
+
+  // Identical lookups that are already on their way share one request.
+  const inflight = new Map();
+  function marketLookup(query, region, kind, platform, opts) {
+    const o = opts || {};
+    const key = mkey(query, region, kind, platform);
+    if (!o.fresh) { const hit = cacheGet(key); if (hit) return Promise.resolve(hit); }
+    if (inflight.has(key)) return inflight.get(key);
+    const p = doLookup(key, query, region, kind, platform).finally(() => inflight.delete(key));
+    inflight.set(key, p);
+    return p;
+  }
+  // Instant answer from cache (any age) while the live one is fetched.
+  function peekMarket(query, region, kind, platform) {
+    const h = cacheAny(mkey(query, region, kind, platform));
+    if (!h || !h.v || !h.v.row) return null;
+    return Object.assign({}, h.v, { stale: Date.now() - h.t > MKT_TTL, cachedAt: h.t });
+  }
+
+  // ---------- eBay asking prices (your Supabase function) ----------
+  const ebayMem = new Map(), ebayFly = new Map();
+  function ebayLookup(query, condition) {
+    if (!CFG.PRICES_ENDPOINT) return Promise.resolve(null);
+    const key = (condition || 'used') + '|' + String(query).toLowerCase().trim();
+    const hit = ebayMem.get(key);
+    if (hit && Date.now() - hit.t < 15 * 60e3) return Promise.resolve(hit.v);
+    if (ebayFly.has(key)) return ebayFly.get(key);
+    const p = (async () => {
+      let res;
+      try {
+        res = await fetch(CFG.PRICES_ENDPOINT, {
+          method: 'POST',
+          signal: AbortSignal.timeout(12000),
+          headers: { 'content-type': 'application/json', ...(CFG.SUPABASE_ANON_KEY ? { authorization: 'Bearer ' + CFG.SUPABASE_ANON_KEY } : {}) },
+          body: JSON.stringify({ query, condition: condition || 'used' }),
+        });
+      } catch (e) { throw new Error('eBay price service unreachable'); }
+      let out = null;
+      try { out = await res.json(); } catch (e) {}
+      if (!res.ok || !out || out.error) throw new Error((out && out.error) || 'eBay price service returned ' + res.status);
+      ebayMem.set(key, { t: Date.now(), v: out });
+      return out;
+    })().finally(() => ebayFly.delete(key));
+    ebayFly.set(key, p);
+    return p;
+  }
+
+  let staleRun = null;
 
   // ---------- Public API ----------
   const Store = {
@@ -792,7 +906,7 @@ window.TROVE_CONFIG = {
       if (error) throw error;
     },
     // 6-digit code sign-in: works entirely inside the installed app, so the
-// magic link never has to bounce through Safari.
+    // magic link never has to bounce through Safari.
     async verifyCode(email, code) {
       if (!supa) await initCloud();
       if (!supa) throw new Error('Cloud sync is not configured yet — see README.');
@@ -826,21 +940,37 @@ window.TROVE_CONFIG = {
     },
 
     marketLookup,
+    peekMarket,
+    pickTier,
+    priceError: null,
 
-    // Live market data. PriceCharting always; eBay asking prices too, once deployed.
-    async refreshPrice(item) {
-      let market = null;
-      try { market = await marketLookup(item.name, item.region, item.kind, item.platform); }
-      catch (e) { if (!CFG.PRICES_ENDPOINT) throw e; }
-      if (market) {
-        const r = market.row;
-        Store.update((s2) => {
-          const it = s2.items.find((i) => i.id === item.id);
-          if (!it) return;
+    // Market value and eBay asking price are fetched at the same time, then written
+    // in one save — not two sequential round trips and two saves.
+    async refreshPrice(item, opts) {
+      const o = opts || {};
+      const write = o.bg ? bgUpdate : Store.update;
+      const [m, e] = await Promise.allSettled([
+        marketLookup(item.name, item.region, item.kind, item.platform, { fresh: o.fresh }),
+        ebayLookup(item.name, item.cond),
+      ]);
+      const market = m.status === 'fulfilled' ? m.value : null;
+      const ebay = e.status === 'fulfilled' ? e.value : null;
+      if (CFG.PRICES_ENDPOINT) Store.priceError = e.status === 'rejected' ? ((e.reason && e.reason.message) || 'eBay price service unreachable') : null;
+
+      if (!market && !ebay) {
+        write((s) => { const it = s.items.find((i) => i.id === item.id); if (it) it.lastFailAt = Date.now(); });
+        throw (m.reason || new Error('No price data'));
+      }
+
+      write((s) => {
+        const it = s.items.find((i) => i.id === item.id);
+        if (!it) return;
+        const now = Date.now();
+        let fresh = false;
+        if (market) {
+          const r = market.row;
           it.tiers = { loose: r.loose, cib: r.cib, sealed: r.sealed };
-          const pick = it.cond === 'sealed' ? (r.sealed || r.cib || r.loose)
-            : it.cond === 'new' ? (it.era === 'current' ? (r.cib || r.loose) : (r.sealed || r.cib || r.loose))
-            : it.cond === 'cib' ? (r.cib || r.loose) : (r.loose || r.cib);
+          const pick = pickTier(r, it.cond, it.era);
           if (pick) it.sell = Math.round(pick);
           if (r.image && !it.image) it.autoImage = r.image;
           if (r.console) it.pcConsole = r.console;
@@ -848,62 +978,42 @@ window.TROVE_CONFIG = {
           it.marketSource = 'PriceCharting';
           it.matchNote = market.note || null;
           it.pcMatch = r.title + (r.console ? ' · ' + r.console : '');
-          it.refreshedAt = Date.now();
-          // Real samples only, one per day — the trend line has to be measured, not drawn.
-          const hist = (it.history || []).filter((h) => h && h.sell);
-          const last = hist[hist.length - 1];
-          if (!last || Date.now() - last.t > 20 * 3600e3) hist.push({ t: Date.now(), buy: it.buy, sell: it.sell });
-          else { last.sell = it.sell; last.buy = it.buy; last.t = Date.now(); }
-          it.history = hist.slice(-120);
-        });
-      }
-      if (!CFG.PRICES_ENDPOINT) return { market: market && market.row };
-      let res;
-      try {
-        res = await fetch(CFG.PRICES_ENDPOINT, {
-          signal: AbortSignal.timeout(12000),
-          method: 'POST',
-          headers: { 'content-type': 'application/json', ...(CFG.SUPABASE_ANON_KEY ? { authorization: 'Bearer ' + CFG.SUPABASE_ANON_KEY } : {}) },
-          body: JSON.stringify({ query: item.name, condition: item.cond }),
-        });
-      } catch (e) {
-        Store.priceError = 'Price service unreachable';
-        emit();
-        // Market values already landed — a missing eBay leg is not a failure.
-        if (market) return { market: market.row, askUnavailable: true };
-        throw new Error(Store.priceError);
-      }
-      if (!res.ok) {
-        Store.priceError = 'Price service returned ' + res.status;
-        emit();
-        if (market) return { market: market.row, askUnavailable: true };
-        throw new Error(Store.priceError);
-      }
-      const out = await res.json(); // { lowestBuy, soldMedian, listings: [...] }
-      Store.priceError = null;
-      Store.update((s) => {
-        const it = s.items.find((i) => i.id === item.id);
-        if (!it) return;
-        if (out.lowestBuy) it.buy = Math.round(out.lowestBuy);
-        if (out.soldMedian) it.sell = Math.round(out.soldMedian);
-        it.listings = out.listings || [];
-        const best = (out.listings || [])[0];
-        if (best) {
-          it.bestUrl = best.url;              // the exact listing the buy price came from
-          it.bestPrice = Math.round(best.landed || best.price);
-          if (!it.image && best.image) it.image = best.image;
+          it.estimated = false;
+          if (!market.stale) fresh = true;
         }
-        if (out.count) it.liveCount = out.count;
-        if (out.soldWk) it.soldWk = out.soldWk;
-        it.estimated = !!out.soldMedianIsEstimate;
-        it.refreshedAt = Date.now();
-        it.history = (it.history || []).concat([{ t: Date.now(), buy: it.buy, sell: it.sell }]).slice(-60);
+        if (ebay) {
+          // A price the person typed in from the table in front of them beats an
+          // online listing for a day.
+          const keepTyped = it.askSrc === 'you' && it.askAt && now - it.askAt < 86400e3;
+          if (ebay.lowestBuy && !keepTyped) { it.buy = Math.round(ebay.lowestBuy); it.askAt = now; it.askSrc = 'ebay'; }
+          if (ebay.soldMedian && (!market || !ebay.soldMedianIsEstimate)) {
+            if (!market) { it.sell = Math.round(ebay.soldMedian); it.estimated = !!ebay.soldMedianIsEstimate; it.marketSource = 'eBay'; }
+          }
+          it.listings = ebay.listings || [];
+          const best = it.listings[0];
+          if (best) {
+            it.bestUrl = best.url;
+            it.bestPrice = Math.round(best.landed || best.price);
+            if (!it.image && !it.autoImage && best.image) it.autoImage = best.image;
+          }
+          if (ebay.count) it.liveCount = ebay.count;
+          if (ebay.soldWk) it.soldWk = ebay.soldWk;
+          fresh = true;
+        }
+        if (fresh) { it.refreshedAt = now; delete it.lastFailAt; }
+        // Real samples only, one per day — the trend line has to be measured, not drawn.
+        const hist = (it.history || []).filter((h) => h && h.sell);
+        const last = hist[hist.length - 1];
+        if (fresh && it.sell) {
+          if (!last || now - last.t > 20 * 3600e3) hist.push({ t: now, buy: it.buy, sell: it.sell });
+          else { last.sell = it.sell; last.buy = it.buy; last.t = now; }
+        }
+        it.history = hist.slice(-120);
       });
-      return out;
+      return { market: market && market.row, ebay, askUnavailable: !ebay };
     },
 
     // ---- Real product photos, no API key: Wikipedia's search + pageimages.
-    // CORS-open, so the phone can fetch it directly. Cached on the item.
     async fetchArt(item) {
       const clean = item.name.replace(/\(.*?\)/g, ' ').replace(/\b(cib|loose|sealed|used|console)\b/gi, ' ').replace(/\s+/g, ' ').trim();
       const url = 'https://en.wikipedia.org/w/api.php?action=query&generator=search'
@@ -915,93 +1025,103 @@ window.TROVE_CONFIG = {
       const pages = (j.query && j.query.pages) || {};
       const first = Object.keys(pages).map((k) => pages[k])[0];
       const thumb = first && first.thumbnail && first.thumbnail.source;
-      Store.update((st2) => {
+      bgUpdate((st2) => {
         const it = st2.items.find((i) => i.id === item.id);
         if (!it) return;
         it.artTried = true;
-        if (thumb) it.autoImage = thumb;
+        if (thumb && !it.autoImage) it.autoImage = thumb;
       });
       return thumb || null;
     },
 
     // Fill in missing artwork in the background, a few at a time.
-    // Photos are fetched ONCE and stored on the item; the screen repaints once at the end.
-    async autoArt(onProgress) {
+    async autoArt() {
       const todo = state.items.filter((i) => !i.image && !i.autoImage && !i.artTried);
       if (!todo.length) return 0;
       await batch(async () => {
-        for (let k = 0; k < todo.length; k += 3) {
-          await Promise.all(todo.slice(k, k + 3).map((it) => Store.fetchArt(it).catch(() => {
-            Store.update((st2) => { const x = st2.items.find((i) => i.id === it.id); if (x) x.artTried = true; });
+        for (let k = 0; k < todo.length; k += 4) {
+          await Promise.all(todo.slice(k, k + 4).map((it) => Store.fetchArt(it).catch(() => {
+            bgUpdate((st2) => { const x = st2.items.find((i) => i.id === it.id); if (x) x.artTried = true; });
           })));
-          if (onProgress) onProgress(Math.min(k + 3, todo.length), todo.length);
+          flush();
         }
       });
       return todo.length;
     },
 
     // Price anything by name without adding it to the catalog.
-    async quickLook(query, condition, region, kind, platform) {
-      const m = await marketLookup(query, region, kind, platform);   // real market data, no keys needed
-      const meta = { note: m.note || null, alts: (m.rows || []).slice(0, 6), searchedAs: m.searchedAs, platform: platform || null, region: region || 'en' };
-      if (!CFG.PRICES_ENDPOINT) {
-        const r = m.row;
-        return Object.assign({ query, market: r, tiers: { loose: r.loose, cib: r.cib, sealed: r.sealed },
-          soldMedian: condition === 'sealed' || condition === 'new' ? (r.sealed || r.cib || r.loose)
-            : condition === 'cib' ? (r.cib || r.loose) : (r.loose || r.cib),
-          image: r.image, pcUrl: r.url, listings: [], askUnknown: true, stale: m.stale, cachedAt: m.cachedAt,
-          resolvedFrom: m.resolvedFrom }, meta);
+    // Market value and the eBay ask are requested in parallel.
+    async quickLook(query, condition, region, kind, platform, opts) {
+      const o = opts || {};
+      const [m, e] = await Promise.allSettled([
+        marketLookup(query, region, kind, platform),
+        o.marketOnly ? Promise.resolve(null) : ebayLookup(query, condition || 'used'),
+      ]);
+      if (m.status === 'rejected') throw m.reason;
+      const mk = m.value, r = mk.row;
+      const ebay = e.status === 'fulfilled' ? e.value : null;
+      if (!o.marketOnly && CFG.PRICES_ENDPOINT) {
+        Store.priceError = e.status === 'rejected' ? ((e.reason && e.reason.message) || 'eBay price service unreachable') : null;
       }
-      const marketOnly = () => {
-        const r = m.row;
-        return Object.assign({ query, market: r, tiers: { loose: r.loose, cib: r.cib, sealed: r.sealed },
-          soldMedian: condition === 'sealed' ? (r.sealed || r.cib || r.loose)
-            : condition === 'cib' ? (r.cib || r.loose) : (r.loose || r.cib),
-          image: r.image, pcUrl: r.url, listings: [], askUnknown: true, stale: m.stale, cachedAt: m.cachedAt,
-          resolvedFrom: m.resolvedFrom }, meta);
+      const out = {
+        query, market: r, tiers: { loose: r.loose, cib: r.cib, sealed: r.sealed },
+        soldMedian: pickTier(r, condition) || (ebay && ebay.soldMedian) || 0,
+        image: r.image, pcUrl: r.url, listings: [], lowestBuy: 0, askUnknown: true,
+        stale: mk.stale, cachedAt: mk.cachedAt, resolvedFrom: mk.resolvedFrom,
+        note: mk.note || null, alts: (mk.rows || []).slice(0, 6), searchedAs: mk.searchedAs,
+        platform: platform || null, region: region || 'en',
       };
-      let res;
-      try {
-        res = await fetch(CFG.PRICES_ENDPOINT, {
-          method: 'POST',
-          signal: AbortSignal.timeout(12000),
-          headers: { 'content-type': 'application/json', ...(CFG.SUPABASE_ANON_KEY ? { authorization: 'Bearer ' + CFG.SUPABASE_ANON_KEY } : {}) },
-          body: JSON.stringify({ query, condition: condition || 'used' }),
-        });
-      } catch (e) { Store.priceError = 'eBay service unreachable'; return marketOnly(); }
-      let out;
-      try { out = await res.json(); } catch (e) { return marketOnly(); }
-      if (!res.ok || out.error) { Store.priceError = out.error || ('Price service returned ' + res.status); emit(); return marketOnly(); }
-      Store.priceError = null;
-      out.market = m.row;
-      out.tiers = { loose: m.row.loose, cib: m.row.cib, sealed: m.row.sealed };
-      if (!out.image) out.image = m.row.image;
-      out.stale = m.stale; out.cachedAt = m.cachedAt; out.resolvedFrom = m.resolvedFrom;
-      Object.assign(out, meta);
+      if (ebay) {
+        out.listings = ebay.listings || [];
+        out.lowestBuy = ebay.lowestBuy || 0;
+        out.askUnknown = !ebay.lowestBuy;
+        out.liveCount = ebay.count || 0;
+        if (!out.image && ebay.image) out.image = ebay.image;
+      }
       return out;
     },
 
-    // Quietly re-check anything whose price is older than REFRESH_HOURS.
-    async refreshStale(force, onProgress) {
-      const maxAge = (CFG.REFRESH_HOURS || 12) * 3600e3;
-      const all = state.items.filter((i) => force || !i.refreshedAt || Date.now() - i.refreshedAt > maxAge);
-      const due = force ? all : all.slice(0, 8);
-      let done = 0;
-      await batch(async () => {
-        for (let k = 0; k < due.length; k += 2) {
-          await Promise.all(due.slice(k, k + 2).map((it) => Store.refreshPrice(it).catch(() => {})));
-          done = Math.min(k + 2, due.length);
-          if (onProgress) onProgress(done, due.length);
-          await new Promise((r) => setTimeout(r, 300));
-        }
-      });
-      return done;
+    // Items whose price is older than the person's freshness window. Items that
+    // just failed are left alone for 20 minutes so a dead source isn't hammered.
+    staleItems() {
+      const hrs = state.settings.refreshHours || CFG.REFRESH_HOURS || 6;
+      const now = Date.now(), maxAge = hrs * 3600e3;
+      return state.items.filter((i) => (!i.refreshedAt || now - i.refreshedAt > maxAge)
+        && !(i.lastFailAt && now - i.lastFailAt < 20 * 60e3));
     },
 
-    get pricesOn() { return !!CFG.PRICES_ENDPOINT; },   // eBay asking prices / exact listings
-    get marketOn() { return true; },                    // PriceCharting market values (keyless)
+    // Re-check prices with a small worker pool: watched items first, then oldest.
+    // The screen and the cloud copy update every few items, not every item.
+    refreshStale(opts, onProgress) {
+      if (staleRun) return staleRun;
+      const o = opts || {};
+      const w = state.watch || {};
+      let due = (o.all ? state.items.slice() : Store.staleItems())
+        .sort((a, b) => (w[a.id] ? 0 : 1) - (w[b.id] ? 0 : 1) || (a.refreshedAt || 0) - (b.refreshedAt || 0));
+      if (o.limit) due = due.slice(0, o.limit);
+      const total = due.length;
+      let done = 0, ok = 0;
+      if (!total) return Promise.resolve(0);
+      staleRun = batch(async () => {
+        const queue = due.slice();
+        const worker = async () => {
+          while (queue.length) {
+            const it = queue.shift();
+            try { await Store.refreshPrice(it, { bg: true, fresh: !!o.all }); ok++; } catch (e) {}
+            done++;
+            if (onProgress) onProgress(done, total);
+            if (done % 3 === 0) flush();
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(3, total) }, worker));
+        return ok;
+      }).finally(() => { staleRun = null; });
+      return staleRun;
+    },
+
+    get pricesOn() { return !!CFG.PRICES_ENDPOINT; },
+    get marketOn() { return true; },
     removeItem(id) { Store.update((s2) => { s2.items = s2.items.filter((i) => i.id !== id); delete s2.watch[id]; }); },
-    priceError: null,
 
     initCloud,
     batch,
@@ -1013,10 +1133,11 @@ window.TROVE_CONFIG = {
 
 </script>
 <script>
-// Trove — UI layer. Search the catalog, read market value, spot steals.
+// Trove — UI layer. Check what anything is worth, decide buy or pass, hunt and flip.
 (function () {
   const S = window.TroveStore;
   const D = window.TroveData;
+  const CFG = window.TROVE_CONFIG || {};
   const $ = (id) => document.getElementById(id);
   const st = () => S.state;
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -1028,7 +1149,6 @@ window.TROVE_CONFIG = {
     const h = Math.round(m / 60);
     return h < 24 ? h + ' hr ago' : Math.round(h / 24) + ' days ago';
   };
-  const src = (k) => D.SOURCES.find((s) => s.key === k) || D.SOURCES[0];
   const platOf = (it) => D.PLATFORMS[it.platform] || D.PLATFORMS.multi;
   const regionOf = (it) => (it.region === 'jp' ? 'Japan' : it.region === 'pal' ? 'PAL' : 'US / EN');
   const condLabel = (k) => (D.CONDS.find((c) => c.key === k) || { label: 'Used' }).label;
@@ -1061,15 +1181,14 @@ window.TROVE_CONFIG = {
   const lastSeen = () => parseInt(localStorage.getItem(SEEN_KEY) || '0', 10);
   const markSeen = () => localStorage.setItem(SEEN_KEY, String(Date.now()));
 
-  // ---------- message notifications ----------
-  // Off until asked for, and per-device: the toggle lives in localStorage so turning
-  // it off on your phone doesn't switch it off on hers.
+  // ---------- notifications (messages + watch targets) ----------
   const NOTIF_KEY = 'trove.notify';
   const NOTIF_AT = 'trove.notify.at';
   const notifOn = () => localStorage.getItem(NOTIF_KEY) === '1';
   const notifSupported = () => typeof Notification !== 'undefined';
   const notifBlocked = () => notifSupported() && Notification.permission === 'denied';
   const notifAt = () => parseInt(localStorage.getItem(NOTIF_AT) || String(Date.now()), 10);
+  const canNotify = () => notifOn() && notifSupported() && Notification.permission === 'granted';
 
   async function enableNotifs() {
     if (!notifSupported()) return toast('This browser can’t show notifications');
@@ -1085,10 +1204,8 @@ window.TROVE_CONFIG = {
     render(); toast('Notifications off');
   }
 
-  // Fired from the store subscription, so a message that arrives from the other phone
-  // notifies once — never for your own messages, never while you're reading the chat.
   function notifyNew() {
-    if (!notifOn() || !notifSupported() || Notification.permission !== 'granted') return;
+    if (!canNotify()) return;
     const since = notifAt();
     const mine = meName();
     const fresh = (st().messages || []).filter((m) => m.t > since && m.by !== mine);
@@ -1105,6 +1222,35 @@ window.TROVE_CONFIG = {
     } catch (e) {}
   }
 
+  // When a live asking price drops to a watch target, say so once per price.
+  const ALERT_KEY = 'trove.alerted';
+  function checkTargets() {
+    const s = st();
+    let seen;
+    try { seen = JSON.parse(localStorage.getItem(ALERT_KEY) || '{}'); } catch (e) { seen = {}; }
+    const hits = [];
+    Object.keys(s.watch || {}).forEach((id) => {
+      const it = (s.items || []).find((i) => i.id === id);
+      const w = s.watch[id];
+      if (!it || !w || !hasAsk(it) || it.buy > w.target) return;
+      const k = id + ':' + it.buy;
+      if (seen[id] === k) return;
+      seen[id] = k;
+      hits.push(it);
+    });
+    if (!hits.length) return;
+    try { localStorage.setItem(ALERT_KEY, JSON.stringify(seen)); } catch (e) {}
+    const msg = hits.length === 1 ? hits[0].name + ' hit your target — ' + money(hits[0].buy)
+      : hits.length + ' watched items hit their targets';
+    setTimeout(() => toast(msg), 50);
+    if (canNotify()) {
+      try {
+        const n = new Notification('Trove — target hit', { body: msg, tag: 'trove-target', icon: 'icon-192.png' });
+        n.onclick = () => { try { window.focus(); } catch (e) {} setUI({ tab: 'watch', sheet: null, detail: null }); n.close(); };
+      } catch (e) {}
+    }
+  }
+
   let ui = { tab: 'browse', q: '', plat: 'all', kind: 'all', era: 'all', region: 'all', sort: 'steal', detail: null, sheet: null, attachItem: null, draft: '', authEmail: '' };
   let toastT = null, qT = null, haulT = null;
 
@@ -1112,24 +1258,43 @@ window.TROVE_CONFIG = {
     if (patch.tab === 'chat' && ui.tab !== 'chat') ui.chatBottom = true;
     Object.assign(ui, patch); render();
   }
+  // Toasts live outside the overlay so a repaint can't wipe them mid-message.
   function toast(msg) {
     clearTimeout(toastT);
-    $('overlay').insertAdjacentHTML('beforeend', `<div class="toast" id="toast">${esc(msg)}</div>`);
-    toastT = setTimeout(() => { const t = $('toast'); if (t) t.remove(); }, 2600);
+    $('toastHost').innerHTML = `<div class="toast" id="toast">${esc(msg)}</div>`;
+    toastT = setTimeout(() => { $('toastHost').innerHTML = ''; }, 2800);
   }
 
-  const hash = (s) => { let h = 0; for (let i = 0; i < String(s).length; i++) h = (h * 31 + String(s).charCodeAt(i)) | 0; return Math.abs(h); };
+  // ---------- freshness ----------
+  const refreshHrs = () => st().settings.refreshHours || CFG.REFRESH_HOURS || 6;
+  function freshness(it) {
+    if (!it.refreshedAt) return { fresh: false, label: 'starter estimate' };
+    return Date.now() - it.refreshedAt < refreshHrs() * 3600e3
+      ? { fresh: true, label: 'checked ' + ago(it.refreshedAt) }
+      : { fresh: false, label: 'out of date · ' + ago(it.refreshedAt) };
+  }
+  const fdot = (f) => `<span class="fdot" style="background:${f.fresh ? 'var(--sage-600)' : 'var(--accent-500)'}"></span>`;
+
+  // An asking price only counts while it's recent: online asks for 2 days,
+  // a price you typed in from the table for 7.
+  const ASK_LIFE = { ebay: 2 * 86400e3, you: 7 * 86400e3 };
+  function hasAsk(it) {
+    return !!it && it.buy > 0 && !!it.askAt && Date.now() - it.askAt < (ASK_LIFE[it.askSrc] || ASK_LIFE.ebay);
+  }
+  const askLabel = (it) => (it.askSrc === 'you' ? 'you entered ' + ago(it.askAt) : 'eBay · ' + ago(it.askAt));
+  const tierFor = (r, cond) => S.pickTier(r, cond);
 
   // ---------- money helpers ----------
   function fees(n) { return st().settings.fees ? n * 0.8675 - 0.3 : n; }
   function mv(it) { return it.sell || 0; }                       // market value = recent sold median
-  function deal(it) {                                            // how far under market the best price is
-    const m = mv(it); if (!m || !it.buy) return 0;
+  function deal(it) {                                            // how far under market the live ask is
+    const m = mv(it); if (!m || !hasAsk(it)) return 0;
     return (m - it.buy) / m;
   }
   function netOf(it) { const net = fees(mv(it)) - it.buy; return { net, pct: it.buy ? (net / it.buy) * 100 : 0 }; }
-  function gap(it) { return Math.max(0, mv(it) - it.buy); }
+  function gap(it) { return hasAsk(it) ? Math.max(0, mv(it) - it.buy) : 0; }
   function grade(it) {
+    if (!hasAsk(it)) return { cls: 'stamp-fair', label: it.buy ? 'Ask out of date' : 'No ask yet' };
     const d = deal(it) * 100;
     if (d >= 38) return { cls: 'stamp-steal', label: 'Steal ' + Math.round(d) + '% off' };
     if (d >= 25) return { cls: 'stamp-good', label: Math.round(d) + '% under market' };
@@ -1138,9 +1303,6 @@ window.TROVE_CONFIG = {
   }
 
   // ---------- real numbers only ----------
-  // Nothing here is invented: market value and the tiers come from PriceCharting,
-  // the trend is measured from readings this app actually stored, and everything
-  // else is arithmetic on top of those two with the assumptions spelled out.
   const SHIP = { game: 5, accessory: 6, handheld: 12, console: 18 };
   function ship(it) { return SHIP[it.kind] || 10; }
 
@@ -1183,7 +1345,7 @@ window.TROVE_CONFIG = {
     const t = histTrend(it);
     if (!t) {
       return `<div style="margin-top:13px;position:relative;border:1px dashed rgba(255,255,255,.28);border-radius:16px;padding:10px 13px;font-size:11px;color:var(--accent-300)">
-        No trend yet — ${samples(it).length ? 'one reading stored' : 'no readings stored'}. Every refresh saves a real data point; the line appears on the second one.</div>`;
+        No trend yet — ${samples(it).length ? 'one reading stored' : 'no readings stored'}. Trove saves one real reading a day as it keeps prices fresh; the line appears on the second.</div>`;
     }
     const up = t.pct >= 0;
     return `<div style="margin-top:13px;position:relative">${spark(it)}
@@ -1191,8 +1353,6 @@ window.TROVE_CONFIG = {
   }
 
   // ---------- the buy / sell flow ----------
-  // One picture of the whole decision: what it's worth, the most you can pay,
-  // what happens at the price you're looking at, and what you keep.
   function flowNode(dot, inner) {
     return `<div style="position:relative;margin-bottom:9px">
       <span style="position:absolute;left:-25px;top:18px;width:14px;height:14px;border-radius:999px;background:${dot};box-shadow:0 0 0 4px var(--surface)"></span>
@@ -1200,7 +1360,7 @@ window.TROVE_CONFIG = {
   }
   function flowChart(it) {
     const m = mv(it), mx = maxBuy(it), p = sellPlan(it), sh = ship(it);
-    const now = it.buy || 0;
+    const now = hasAsk(it) ? it.buy : 0;
     const breakEven = Math.round(fees(m) - sh);
     const mode = !now ? 'unknown' : now <= mx ? 'buy' : now <= breakEven ? 'thin' : 'pass';
     const profit = now ? Math.round(p.net - now) : null;
@@ -1215,7 +1375,7 @@ window.TROVE_CONFIG = {
         ? { t: 'Thin \u2014 profitable, but under your ' + targetMargin() + '% target', c: 'var(--accent-800)', bg: 'var(--accent-100)', bd: 'var(--accent-300)' }
         : mode === 'pass'
           ? { t: 'Pass \u2014 ' + money(now - breakEven) + ' past break-even', c: 'var(--accent-900)', bg: 'var(--accent-200)', bd: 'var(--accent-500)' }
-          : { t: 'No asking price yet \u2014 refresh, or type what you were quoted', c: 'var(--n-800)', bg: 'var(--n-200)', bd: 'var(--n-400)' };
+          : { t: 'Type what they\u2019re asking to get a buy or pass', c: 'var(--n-800)', bg: 'var(--n-200)', bd: 'var(--n-400)' };
 
     return `<div style="position:relative;padding-left:25px;margin-top:6px">
       <div style="position:absolute;left:6px;top:14px;bottom:22px;width:2px;background:var(--n-400)"></div>
@@ -1223,7 +1383,7 @@ window.TROVE_CONFIG = {
       ${flowNode('var(--n-700)', `<div style="${box('var(--n-100)', 'var(--n-400)')}">
         <div class="kicker">Market value \u00b7 ${esc(condLabel(it.cond))}</div>
         <div class="disp" style="font-size:26px;margin-top:2px">${money(m)}</div>
-        <div class="muted" style="font-size:10.5px">${it.pcMatch ? esc(it.pcMatch) : esc(it.marketSource || 'starter number \u2014 refresh for live data')}</div>
+        <div class="muted" style="font-size:10.5px">${it.pcMatch ? esc(it.pcMatch) : esc(it.marketSource || 'starter estimate \u2014 updating')}</div>
       </div>`)}
 
       ${flowNode('var(--accent)', `<div style="${box('var(--surface)', 'var(--accent-300)')}">
@@ -1238,7 +1398,7 @@ window.TROVE_CONFIG = {
 
       ${flowNode(mode === 'buy' ? 'var(--sage-700)' : 'var(--accent-700)', `<div style="${box(verdict.bg, verdict.bd)}">
         <div style="display:flex;align-items:flex-end;gap:12px">
-          <div><div class="kicker">Cheapest you have seen</div>
+          <div><div class="kicker">They\u2019re asking</div>
             <div class="disp" style="font-size:22px">${now ? money(now) : '\u2014'}</div></div>
           <div style="margin-left:auto;text-align:right;max-width:58%;font-size:11.5px;font-weight:700;color:${verdict.c}">${esc(verdict.t)}</div>
         </div>
@@ -1255,8 +1415,6 @@ window.TROVE_CONFIG = {
   }
 
   // ---------- deal hunting ----------
-  // Real searches built with eBay's own filters, aimed at what a picker wants:
-  // tested copies, under a number, before anyone else finds them.
   function dealsBlock(it) {
     const m = mv(it);
     const links = D.dealLinks(it.name, {
@@ -1295,7 +1453,6 @@ window.TROVE_CONFIG = {
   let scanVideo = null, scanStream = null, scanTimer = null, scanReader = null, scanStarting = false;
   let scanCanvas = null, scanTicks = 0, scanStatT = null;
 
-  // ZXing ships a plain browser build; load that first — module CDNs are the flakier path.
   async function loadZX() {
     if (window.ZXing) return window.ZXing;
     await new Promise((res) => {
@@ -1311,7 +1468,7 @@ window.TROVE_CONFIG = {
   async function startScan() {
     if (scanStarting) return;
     scanStarting = true;
-    stopScan();                                   // always start from a clean slate
+    stopScan();
     scan.err = null; scan.engine = 'starting'; render();
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       scan.engine = null;
@@ -1330,7 +1487,6 @@ window.TROVE_CONFIG = {
         : 'No camera available — type the numbers under the barcode.';
       scanStarting = false; return render();
     }
-    // keep the lens hunting for focus at close range where barcodes live
     try {
       const track = scanStream.getVideoTracks()[0];
       const caps = track.getCapabilities ? track.getCapabilities() : {};
@@ -1347,10 +1503,6 @@ window.TROVE_CONFIG = {
     try { await scanVideo.play(); } catch (err) {}
     mountScan();
 
-    // Two engines, both fed the same cropped frames: the OS detector when the phone
-    // has one, ZXing as the universal fallback. Decoding a canvas beats handing the
-    // raw <video> over — we can crop to the reticle and upscale, which is what makes
-    // a small barcode in a wide frame actually readable.
     const FORMATS = ['ean_13', 'upc_a', 'upc_e', 'ean_8', 'code_128', 'code_39', 'itf'];
     let det = null;
     if ('BarcodeDetector' in window) {
@@ -1381,8 +1533,6 @@ window.TROVE_CONFIG = {
     render();
   }
 
-  // One detection pass. Alternates full frame / zoomed centre crop so both a
-  // whole box held back and a barcode pushed right up to the lens can land.
   let scanBusyTick = false;
   async function scanTick(det, zx) {
     if (scanBusyTick || !scanVideo || !scanStream || scan.busy || scan.code) return;
@@ -1444,7 +1594,6 @@ window.TROVE_CONFIG = {
     if (host && scanVideo && scanVideo.parentNode !== host) host.insertBefore(scanVideo, host.firstChild);
   }
 
-  // A barcode alone is ambiguous, so we hold it and ask what kind of thing it is.
   function onCode(code) {
     code = String(code || '').replace(/\D/g, '');
     if (!code || scan.busy || code === scan.code) return;
@@ -1469,20 +1618,25 @@ window.TROVE_CONFIG = {
     render();
   }
 
-  // Turn a lookup result into a tracked item.
-  function trackResult(r, kind, cond, region) {
+  // Turn a lookup result into a tracked item. No made-up asking price: if there
+  // isn't a live one, the item simply has none until there is.
+  function trackResult(r, kind, cond, region, platform) {
     const id = uid();
     const sell = Math.round(r.soldMedian || 0);
+    const ask = Math.round(r.lowestBuy || 0);
+    const plat = platform || 'multi';
+    const now = Date.now();
     S.update((st2) => {
       st2.items.unshift({ id, name: (r.market && r.market.title) || r.query, kind: kind || 'game',
-        platform: 'multi', era: 'retro', cond: cond || 'used', region: region || 'en',
-        buy: Math.round(r.lowestBuy || 0), sell, tiers: r.tiers || null,
-        autoImage: r.image || null, pcUrl: r.pcUrl || null, marketSource: 'PriceCharting',
+        platform: plat, era: D.CURRENT_PLATFORMS.includes(plat) ? 'current' : 'retro',
+        cond: cond || 'used', region: region || 'en',
+        buy: ask, askAt: ask ? now : 0, askSrc: ask ? 'ebay' : null, sell, tiers: r.tiers || null,
+        autoImage: r.image || null, pcUrl: r.pcUrl || (r.market && r.market.url) || null, marketSource: 'PriceCharting',
+        pcMatch: r.market ? r.market.title + (r.market.console ? ' · ' + r.market.console : '') : null,
         listings: r.listings || [], bestUrl: (r.listings || [])[0] && r.listings[0].url,
-        upc: r.code || null, refreshedAt: Date.now(), history: [{ t: Date.now(), buy: r.lowestBuy || 0, sell }] });
+        upc: r.code || null, refreshedAt: r.stale ? (r.cachedAt || now) : now,
+        history: sell ? [{ t: now, buy: ask, sell }] : [] });
     });
-    const it = st().items.find((i) => i.id === id);
-    if (it && !it.buy) S.update((st2) => { const x = st2.items.find((i) => i.id === id); if (x) x.buy = maxBuy(x); });
     return id;
   }
 
@@ -1496,7 +1650,6 @@ window.TROVE_CONFIG = {
         <img src="${esc(photo)}" alt="${esc(it.name)}" loading="lazy" style="object-fit:contain;padding:${Math.round(size * 0.06)}px">
       </div>`;
     }
-    // No photo yet: draw the shape of the thing, tinted to its platform.
     const shape = it.kind === 'game'
       ? '<span class="dev"></span><span class="cartnotch"></span>'
       : it.kind === 'console'
@@ -1512,7 +1665,7 @@ window.TROVE_CONFIG = {
 
   // ---------- links ----------
   const buyUrl = (it) => it.bestUrl || D.dealLinks(it.name, { region: it.region || 'en', maxBuy: maxBuy(it) })[0].url;
-  const buyLabel = (it) => (it.bestUrl ? 'Buy ' + money(it.bestPrice || it.buy) : 'Hunt one under ' + money(maxBuy(it)));
+  const buyLabel = (it) => (it.bestUrl && hasAsk(it) ? 'Buy ' + money(it.bestPrice || it.buy) : 'Hunt one under ' + money(maxBuy(it)));
 
   // ---------- filtering ----------
   function catalog() {
@@ -1524,9 +1677,10 @@ window.TROVE_CONFIG = {
     if (ui.kind !== 'all') list = list.filter((i) => i.kind === ui.kind);
     if (ui.era !== 'all') list = list.filter((i) => i.era === ui.era);
     if (ui.region !== 'all') list = list.filter((i) => (i.region || 'en') === ui.region);
+    const price = (i) => (hasAsk(i) ? i.buy : mv(i));
     const by = {
-      steal: (a, b) => gap(b) - gap(a),
-      cheap: (a, b) => a.buy - b.buy,
+      steal: (a, b) => gap(b) - gap(a) || (b.refreshedAt || 0) - (a.refreshedAt || 0),
+      cheap: (a, b) => price(a) - price(b),
       value: (a, b) => mv(b) - mv(a),
       az: (a, b) => a.name.localeCompare(b.name),
     }[ui.sort];
@@ -1542,23 +1696,50 @@ window.TROVE_CONFIG = {
   // ---------- rows ----------
   function itemRow(it) {
     const g = grade(it);
+    const f = freshness(it);
+    const ask = hasAsk(it);
     return `<button class="row" data-open="${it.id}">
       ${art(it, 54)}
       <div style="flex:1;min-width:0">
         <div class="ellip" style="font-size:13.5px;font-weight:700">${esc(it.name)}</div>
-        <div style="display:flex;align-items:center;gap:6px;margin-top:4px">
-          <span class="tag tag-plat" style="background:${platOf(it)[1]};color:${platOf(it)[2]}">${esc(platOf(it)[0])}</span>
-          <span class="muted" style="font-size:10.5px">${esc(condLabel(it.cond))} · market ${money(mv(it))}</span>
+        <div style="display:flex;align-items:center;gap:6px;margin-top:4px;min-width:0">
+          <span class="tag tag-plat" style="background:${platOf(it)[1]};color:${platOf(it)[2]};flex:none">${esc(platOf(it)[0])}</span>
+          <span class="muted ellip" style="font-size:10.5px">${esc(condLabel(it.cond))} · ${fdot(f)}${esc(f.label)}</span>
         </div>
       </div>
       <div style="flex:none;text-align:right">
-        <div class="disp" style="font-size:18px">${money(it.buy)}</div>
-        <div class="stamp ${g.cls}" style="margin-top:5px;font-size:9.5px;padding:3px 8px">${esc(g.label)}</div>
+        <div class="disp" style="font-size:18px">${money(ask ? it.buy : mv(it))}</div>
+        ${ask ? `<div class="stamp ${g.cls}" style="margin-top:5px;font-size:9.5px;padding:3px 8px">${esc(g.label)}</div>`
+          : `<div class="muted" style="font-size:10px;margin-top:4px">market value</div>`}
       </div>
     </button>`;
   }
 
-  // ---------- refresh bar ----------
+  // ---------- keeping prices fresh ----------
+  let lastAuto = 0;
+  async function runRefresh(opts, quiet) {
+    if (ui.refresh) return;
+    const o = opts || {};
+    const due = o.all ? st().items.length : Math.min(S.staleItems().length, o.limit || 1e9);
+    if (!due) { if (!quiet) toast('Every price is already fresh'); return; }
+    ui.refresh = { done: 0, total: due };
+    paintRefreshBar();
+    try {
+      const n = await S.refreshStale(o, (done, total) => { ui.refresh = { done, total }; paintRefreshBar(); });
+      if (!quiet) toast(n ? 'Updated ' + n + ' price' + (n > 1 ? 's' : '') : 'Couldn’t reach the price source — try again shortly');
+    } catch (err) { if (!quiet) toast(err.message); }
+    ui.refresh = null;
+    renderBg();
+  }
+  // Quietly bring out-of-date prices current: on launch, when the app comes back
+  // to the foreground, and every 15 minutes while it's open. Watched items first.
+  function autoRefresh() {
+    if (st().settings.autoRefresh === false || document.hidden || navigator.onLine === false) return;
+    if (Date.now() - lastAuto < 10 * 60e3) return;
+    lastAuto = Date.now();
+    runRefresh({ limit: 12 }, true);
+  }
+
   function refreshBarHtml() {
     const r = ui.refresh;
     if (r) {
@@ -1566,15 +1747,24 @@ window.TROVE_CONFIG = {
       return `<div style="background:var(--sage-100);border-radius:20px;padding:11px 14px">
         <div style="display:flex;align-items:center;gap:9px">
           <span class="spin" style="color:var(--sage-700);display:grid;place-items:center">${svg(ICON.refresh, 17)}</span>
-          <span style="flex:1;font-size:12px;font-weight:700;color:var(--sage-800)">Checking prices — ${r.done} of ${r.total || '…'}</span>
+          <span style="flex:1;font-size:12px;font-weight:700;color:var(--sage-800)">Updating prices — ${r.done} of ${r.total || '…'}</span>
           <span class="disp" style="font-size:13px;color:var(--sage-800)">${pct}%</span>
         </div>
         <div class="bar" style="margin-top:9px;background:var(--sage-200)"><i style="width:${Math.max(4, pct)}%;background:var(--sage-700);transition:width .3s ease"></i></div>
       </div>`;
     }
-    return `<button class="row" data-refreshall="1" style="min-height:0;padding:9px 13px;background:var(--sage-100);box-shadow:none">
-        <span style="color:var(--sage-700);display:grid;place-items:center">${svg(ICON.refresh, 17)}</span>
-        <span style="flex:1;font-size:12px;font-weight:700;color:var(--sage-800)">Prices last checked ${lastCheckedText()} — tap to re-check</span>
+    const stale = S.staleItems().length;
+    const bg = stale ? 'var(--accent-100)' : 'var(--sage-100)';
+    const fg = stale ? 'var(--accent-800)' : 'var(--sage-800)';
+    const txt = stale
+      ? stale + ' price' + (stale > 1 ? 's' : '') + ' out of date — tap to update now'
+      : 'All prices fresh · checked ' + lastCheckedText() + ' · tap to re-check';
+    return `<button class="row" data-refreshall="1" style="min-height:0;padding:9px 13px;background:${bg};box-shadow:none">
+        <span style="color:${fg};display:grid;place-items:center">${svg(ICON.refresh, 17)}</span>
+        <span style="flex:1;min-width:0">
+          <span style="display:block;font-size:12px;font-weight:700;color:${fg}">${esc(txt)}</span>
+          ${S.priceError ? `<span class="muted" style="display:block;font-size:10.5px">eBay asks unavailable (${esc(S.priceError)}) — market values still live</span>` : ''}
+        </span>
       </button>`;
   }
   function lastCheckedText() {
@@ -1586,18 +1776,134 @@ window.TROVE_CONFIG = {
     if (el) el.innerHTML = refreshBarHtml();
   }
 
+  // ---------- live search ----------
+  // The search box does two jobs at once: filters what you track, and — after a
+  // short pause in typing — pulls the live market price for whatever you typed.
+  const live = { q: '', busy: false, r: null, err: null, args: '' };
+  let liveSeq = 0, liveT = null;
+  const liveArgs = () => ({
+    region: ui.region === 'all' ? 'en' : ui.region,
+    kind: ui.kind === 'all' ? null : ui.kind,
+    platform: ui.plat === 'all' ? null : ui.plat,
+  });
+  function scheduleLive() {
+    clearTimeout(liveT);
+    const q = ui.q.trim();
+    if (q.length < 3) {
+      liveSeq++;
+      Object.assign(live, { q: '', busy: false, r: null, err: null, args: '' });
+      return paintLive();
+    }
+    liveT = setTimeout(runLive, 550);
+  }
+  async function runLive() {
+    const q = ui.q.trim();
+    if (q.length < 3) return;
+    const a = liveArgs(), sig = JSON.stringify(a);
+    if (live.q === q && live.args === sig && live.r && !live.busy && !live.r.stale) return;
+    const seq = ++liveSeq;
+    const peek = S.peekMarket(q, a.region, a.kind, a.platform);
+    Object.assign(live, { q, busy: true, err: null, r: peek, args: sig });
+    if (peek && !peek.stale) { live.busy = false; return paintLive(); }
+    paintLive();
+    try {
+      const r = await S.marketLookup(q, a.region, a.kind, a.platform);
+      if (seq !== liveSeq) return;
+      live.r = r;
+    } catch (err) {
+      if (seq !== liveSeq) return;
+      live.err = err.message;
+    }
+    live.busy = false;
+    paintLive();
+  }
+  function liveHtml() {
+    if (!live.q) return '';
+    const r = live.r && live.r.row;
+    if (!r) {
+      return `<div class="card" style="margin-bottom:12px;display:flex;align-items:center;gap:10px">
+        ${live.busy
+          ? `<span class="spin" style="color:var(--accent);display:grid;place-items:center">${svg(ICON.refresh, 16)}</span>
+             <span style="font-size:12.5px;font-weight:600">Checking the live market for “${esc(live.q)}”…</span>`
+          : `<span class="muted" style="font-size:12px">${esc(live.err || 'No market match yet')}</span>`}
+      </div>`;
+    }
+    const a = liveArgs();
+    const subj = { kind: a.kind || 'game', cond: 'used', sell: tierFor(r, 'used') };
+    return `<div class="cab" style="margin-bottom:12px">
+      <span class="scan"></span><span class="glow"></span>
+      <div style="position:relative">
+        <div style="display:flex;align-items:center;gap:12px">
+          ${r.image ? `<div class="art" style="width:52px;height:52px;background:#fff;flex:none"><img src="${esc(r.image)}" alt="" style="object-fit:contain;padding:3px"></div>` : ''}
+          <div style="min-width:0;flex:1">
+            <div class="kicker">${live.busy ? 'Updating…' : live.r.stale ? 'Saved ' + ago(live.r.cachedAt) : 'Live market price'}</div>
+            <div class="disp ellip" style="font-size:17px;margin-top:4px">${esc(r.title)}</div>
+            <div style="font-size:10.5px;color:var(--accent-300);margin-top:2px">${esc(r.console || '')}</div>
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:12px">
+          <div class="stat"><b>${money(r.loose)}</b><span>Loose</span></div>
+          <div class="stat"><b>${money(r.cib)}</b><span>CIB</span></div>
+          <div class="stat"><b>${money(r.sealed)}</b><span>New</span></div>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;margin-top:12px">
+          <div style="flex:1;font-size:11.5px;color:var(--accent-300)">Pay no more than <b class="disp" style="font-size:18px;color:var(--sage-300)">${money(maxBuy(subj))}</b> loose</div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:12px">
+          <button class="btn" data-livecheck="1" style="flex:1;background:var(--accent-300);color:var(--accent-900)">Buy or pass?</button>
+          <button class="btn" data-livetrack="1" style="border:1px solid rgba(255,255,255,.3);color:var(--accent-100)">Track</button>
+        </div>
+      </div>
+    </div>`;
+  }
+  function paintLive() {
+    const el = $('liveCard');
+    if (el) el.innerHTML = liveHtml();
+  }
+
+  // ---------- purpose ----------
+  const INTRO_KEY = 'trove.intro.v2';
+  function introHtml() {
+    if (localStorage.getItem(INTRO_KEY)) return '';
+    const step = (n, t, d) => `<div style="background:rgba(255,255,255,.1);border-radius:16px;padding:10px">
+      <div class="disp" style="font-size:20px;color:var(--accent-300)">${n}</div>
+      <div style="font-size:12px;font-weight:800;margin-top:4px">${t}</div>
+      <div style="font-size:10.5px;opacity:.85;margin-top:2px;line-height:1.35">${d}</div></div>`;
+    return `<div class="cab" style="margin:4px 0 12px">
+      <span class="scan"></span><span class="glow"></span>
+      <div style="position:relative">
+        <div class="kicker">What Trove is for</div>
+        <div class="disp" style="font-size:21px;margin-top:6px">Know what it’s worth before you pay for it.</div>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:12px">
+          ${step('1', 'Check', 'Type it, scan it, or price a whole pile.')}
+          ${step('2', 'Decide', 'Get a pay-no-more-than number and a buy or pass.')}
+          ${step('3', 'Profit', 'Watch for drops, flip it, log what you made.')}
+        </div>
+        <button class="btn" data-dismissintro="1" style="margin-top:12px;width:100%;border:1px solid rgba(255,255,255,.3);color:var(--accent-100)">Got it</button>
+      </div>
+    </div>`;
+  }
+
   // ---------- screens ----------
   function browseScreen() {
     const list = catalog();
-    const steals = list.filter((i) => deal(i) >= 0.38).length;
     const sorts = [['steal', 'Steals'], ['cheap', 'Cheapest'], ['value', 'Top value'], ['az', 'A–Z']];
     return `<div class="screen">
-      <div id="refreshBar" style="margin:4px 0 10px">${refreshBarHtml()}</div>
-      <div class="search" style="margin:4px 0 12px">
+      ${introHtml()}
+      <div class="search" style="margin:4px 0 10px">
         ${svg(ICON.search, 18)}
-        <input id="searchBox" placeholder="Search consoles, handhelds, games…" value="${esc(ui.q)}" autocomplete="off">
+        <input id="searchBox" placeholder="What’s it worth? Type any game or console" value="${esc(ui.q)}" autocomplete="off" enterkeyhint="search">
         ${ui.q ? `<button class="icon-btn" data-clearq="1" aria-label="Clear" style="width:36px;height:36px;background:var(--n-200)">${svg(ICON.x, 15)}</button>` : ''}
       </div>
+      <div id="liveCard">${liveHtml()}</div>
+
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:12px">
+        ${[['scan', ICON.scan, 'Scan'], ['quick', ICON.chart, 'Price'], ['haul', ICON.box, 'Pile'], ['add', ICON.plus, 'Track']]
+          .map(([k, i, l]) => `<button class="btn btn-ghost" data-sheet="${k}"
+            style="flex-direction:column;gap:3px;padding:9px 4px;font-size:11px;min-width:0;background:var(--surface);box-shadow:var(--shadow-sm);border-radius:18px">${svg(i, 17)}<span>${l}</span></button>`).join('')}
+      </div>
+
+      <div id="refreshBar" style="margin:4px 0 12px">${refreshBarHtml()}</div>
 
       <div class="chips">
         <button class="chip" data-era="all" aria-pressed="${ui.era === 'all'}">All eras</button>
@@ -1620,25 +1926,18 @@ window.TROVE_CONFIG = {
       </div>
 
       <div class="kicker" id="browseCount" style="margin-bottom:8px">${countText(list)}</div>
-      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:12px">
-        ${[['scan', ICON.scan, 'Scan'], ['quick', ICON.chart, 'Price'], ['haul', ICON.box, 'Haul'], ['add', ICON.plus, 'Track']]
-          .map(([k, i, l]) => `<button class="btn btn-ghost" data-sheet="${k}"
-            style="flex-direction:column;gap:3px;padding:9px 4px;font-size:11px;min-width:0">${svg(i, 17)}<span>${l}</span></button>`).join('')}
-      </div>
-
       <div id="resultList" style="display:flex;flex-direction:column;gap:9px">${listHtml(list)}</div>
     </div>`;
   }
 
   const countText = (list) => {
     const steals = list.filter((i) => deal(i) >= 0.38).length;
-    return list.length + ' tracked' + (steals ? ' · ' + steals + ' steal' + (steals > 1 ? 's' : '') : '');
+    return 'Your tracked items · ' + list.length + (steals ? ' · ' + steals + ' steal' + (steals > 1 ? 's' : '') : '');
   };
   const listHtml = (list) => (list.length ? list.map(itemRow).join('')
-    : `<div style="text-align:center;padding:34px 18px;border:1px dashed var(--n-400);border-radius:26px">
-         <div class="disp" style="font-size:18px">Nothing matches that</div>
-         <p class="muted" style="font-size:12px;margin:8px 0 0">Try a different platform, or track it by name.</p>
-         <button class="btn btn-secondary" data-sheet="add" style="margin-top:12px">Track “${esc(ui.q || 'a new item')}”</button>
+    : `<div style="text-align:center;padding:28px 18px;border:1px dashed var(--n-400);border-radius:26px">
+         <div class="disp" style="font-size:18px">${ui.q ? 'You don’t track this yet' : 'Nothing matches that'}</div>
+         <p class="muted" style="font-size:12px;margin:8px 0 0">${ui.q ? 'The live price is above — tap Track on it to keep an eye on it.' : 'Try a different platform or filter.'}</p>
        </div>`);
 
   // Typing must never rebuild the screen — only the rows below the box change.
@@ -1654,12 +1953,13 @@ window.TROVE_CONFIG = {
   }
 
   function stealsScreen() {
-    const list = (st().items || []).map((i) => Object.assign({ platform: 'multi', era: 'current' }, i))
-      .filter((i) => deal(i) >= 0.25).sort((a, b) => gap(b) - gap(a));
+    const items = (st().items || []).map((i) => Object.assign({ platform: 'multi', era: 'current' }, i));
+    const list = items.filter((i) => deal(i) >= 0.25).sort((a, b) => gap(b) - gap(a));
+    const noAsk = items.filter((i) => !hasAsk(i)).length;
     const hero = list[0];
     return `<div class="screen">
       <h4 style="margin:6px 0 4px">Steals</h4>
-      <p class="muted" style="font-size:12.5px">Asking prices sitting well under what the thing actually sells for.</p>
+      <p class="muted" style="font-size:12.5px">Live asking prices sitting well under what the thing actually sells for. Only real, recent asks count.</p>
 
       ${hero ? `<div class="cab" style="margin-bottom:16px">
         <span class="scan"></span>
@@ -1668,6 +1968,7 @@ window.TROVE_CONFIG = {
           <div style="min-width:0;flex:1">
             <div class="kicker">Biggest gap right now · ${money(gap(hero))} under</div>
             <div class="disp" style="font-size:20px;margin-top:5px">${esc(hero.name)}</div>
+            <div style="font-size:10.5px;color:var(--accent-300);margin-top:4px">${esc(askLabel(hero))}</div>
           </div>
         </div>
         <div style="display:flex;align-items:flex-end;gap:16px;margin-top:16px;position:relative">
@@ -1686,12 +1987,15 @@ window.TROVE_CONFIG = {
         </div>
         <div style="margin-top:14px;position:relative">${sparkBlock(hero)}</div>
         <div style="display:flex;gap:9px;margin-top:14px;position:relative">
-          <a class="btn" href="${buyUrl(hero)}" target="_blank" rel="noopener" style="flex:1;background:var(--accent-300);color:var(--accent-900);box-shadow:0 4px 0 rgba(32,30,29,.4)">${esc(buyLabel(hero))}</a>
+          <a class="btn" href="${esc(buyUrl(hero))}" target="_blank" rel="noopener" style="flex:1;background:var(--accent-300);color:var(--accent-900);box-shadow:0 4px 0 rgba(32,30,29,.4)">${esc(buyLabel(hero))}</a>
           <button class="btn" data-open="${hero.id}" style="border:1px solid rgba(255,255,255,.3);color:var(--accent-100)">Details</button>
         </div>
       </div>` : `<div style="text-align:center;padding:34px 18px;border:1px dashed var(--n-400);border-radius:26px">
         <div class="disp" style="font-size:18px">No steals on the board</div>
-        <p class="muted" style="font-size:12px;margin:8px 0 0">Everything you track is priced at or above market. Refresh prices, or add more to watch.</p>
+        <p class="muted" style="font-size:12px;margin:8px 0 0">${noAsk
+          ? noAsk + ' tracked item' + (noAsk > 1 ? 's have' : ' has') + ' no live asking price yet. Trove fills them in as it updates' + (S.priceError ? ' — but eBay asks are unavailable right now (' + esc(S.priceError) + ')' : '') + '. You can also type a price you were quoted on any item.'
+          : 'Everything you track is priced at or above market right now.'}</p>
+        <button class="btn btn-secondary" data-refreshall="1" style="margin-top:12px">Update prices now</button>
       </div>`}
 
       ${list.length > 1 ? `<div style="display:flex;flex-direction:column;gap:9px">${list.slice(1).map(itemRow).join('')}</div>` : ''}
@@ -1704,9 +2008,10 @@ window.TROVE_CONFIG = {
     const rows = ids.map((id) => ({ it: (s.items || []).find((i) => i.id === id), w: s.watch[id] })).filter((r) => r.it);
     return `<div class="screen">
       <h4 style="margin:6px 0 4px">Watchlist</h4>
-      <p class="muted" style="font-size:12.5px">${rows.length} tracked · ${rows.filter((r) => r.it.buy <= r.w.target).length} at target</p>
+      <p class="muted" style="font-size:12.5px">${rows.length} watched · ${rows.filter((r) => hasAsk(r.it) && r.it.buy <= r.w.target).length} at target · checked first on every update${canNotify() ? ' · alerts on' : ''}</p>
       ${rows.length ? rows.map(({ it, w }) => {
-      const hit = it.buy <= w.target;
+      const ask = hasAsk(it);
+      const hit = ask && it.buy <= w.target;
       return `<div class="card" style="margin-bottom:10px">
           <div style="display:flex;align-items:center;gap:11px">
             ${art(it, 46)}
@@ -1716,16 +2021,16 @@ window.TROVE_CONFIG = {
             </div>
             <button class="icon-btn" data-unwatch="${it.id}" aria-label="Stop watching" style="background:transparent;color:var(--accent)">${svg(ICON.mark, 19)}</button>
           </div>
-          <div class="bar" style="margin-top:12px"><i style="width:${Math.max(6, Math.min(100, (w.target / Math.max(it.buy, 1)) * 100))}%;background:${hit ? 'var(--sage-700)' : 'var(--accent-600)'}"></i></div>
+          <div class="bar" style="margin-top:12px"><i style="width:${ask ? Math.max(6, Math.min(100, (w.target / Math.max(it.buy, 1)) * 100)) : 6}%;background:${hit ? 'var(--sage-700)' : 'var(--accent-600)'}"></i></div>
           <div style="display:flex;justify-content:space-between;margin-top:7px;font-size:11px">
-            <a href="${buyUrl(it)}" target="_blank" rel="noopener">Now ${money(it.buy)} — open listings</a>
-            <b style="color:${hit ? 'var(--sage-700)' : 'var(--accent-700)'}">${hit ? 'Target hit' : money(it.buy - w.target) + ' to go'}</b>
+            <a href="${esc(buyUrl(it))}" target="_blank" rel="noopener">${ask ? 'Now ' + money(it.buy) + ' — open listings' : 'No live ask yet — search listings'}</a>
+            <b style="color:${hit ? 'var(--sage-700)' : 'var(--accent-700)'}">${hit ? 'Target hit' : ask ? money(it.buy - w.target) + ' to go' : 'waiting'}</b>
           </div>
         </div>`;
     }).join('')
       : `<div style="text-align:center;padding:34px 18px;border:1px dashed var(--n-400);border-radius:26px;margin-top:14px">
            <div class="disp" style="font-size:18px">Nothing watched yet</div>
-           <p class="muted" style="font-size:12px;margin:8px 0 0">Open any item and set a target price.</p>
+           <p class="muted" style="font-size:12px;margin:8px 0 0">Open any item and set a target price — Trove tells you when a live ask drops to it.</p>
          </div>`}
     </div>`;
   }
@@ -1764,6 +2069,8 @@ window.TROVE_CONFIG = {
     return names[0] || 'your household';
   }
 
+  const priceLine = (i) => (hasAsk(i) ? money(i.buy) + ' · ' : '') + 'market ' + money(mv(i));
+
   function bubble(m) {
     const mine = m.by === meName();
     const item = m.itemId && (st().items || []).find((i) => i.id === m.itemId);
@@ -1773,12 +2080,12 @@ window.TROVE_CONFIG = {
       <div style="max-width:86%;background:${mine ? 'var(--accent)' : 'var(--surface)'};color:${mine ? 'var(--bg)' : 'var(--text)'};
         border-radius:20px;padding:10px 14px;font-size:13.5px;line-height:1.45">
         ${m.text ? esc(m.text).replace(/\n/g, '<br>') : ''}
-        ${item ? `<a href="${buyUrl(item)}" target="_blank" rel="noopener" style="display:flex;align-items:center;gap:10px;margin-top:${m.text ? '10px' : '0'};
+        ${item ? `<a href="${esc(buyUrl(item))}" target="_blank" rel="noopener" style="display:flex;align-items:center;gap:10px;margin-top:${m.text ? '10px' : '0'};
             background:${mine ? 'rgba(255,255,255,.16)' : 'var(--bg)'};border-radius:16px;padding:9px 11px;text-decoration:none;color:inherit">
             ${art(item, 36)}
             <div style="flex:1;min-width:0">
               <div class="ellip" style="font-size:12px;font-weight:700">${esc(item.name)}</div>
-              <div style="font-size:10.5px;opacity:.85">${money(item.buy)} · market ${money(mv(item))}</div>
+              <div style="font-size:10.5px;opacity:.85">${priceLine(item)}</div>
             </div>${svg(ICON.out, 12)}
           </a>` : ''}
       </div>
@@ -1819,6 +2126,7 @@ window.TROVE_CONFIG = {
 
   function youScreen() {
     const s = st();
+    const auto = s.settings.autoRefresh !== false;
     return `<div class="screen">
       <div class="card" style="text-align:center">
         <div class="disp" style="font-size:21px">${esc(s.householdName)}</div>
@@ -1842,11 +2150,29 @@ window.TROVE_CONFIG = {
         <div class="muted" style="font-size:10.5px;margin-top:6px">Shown on your chat messages and the flips you log.</div>
       </div>
 
+      <h4 style="margin:22px 0 10px">Keeping prices fresh</h4>
+      <div class="card">
+        <div style="display:flex;align-items:center;gap:10px">
+          <div style="flex:1">
+            <div style="font-size:12.5px;font-weight:700">Update prices automatically</div>
+            <div class="muted" style="font-size:10.5px">${auto ? 'On open, when you come back to the app, and every 15 min while it’s open — watched items first' : 'Off — prices only update when you tap'}</div>
+          </div>
+          <button class="switch" data-toggleauto="1" role="switch" aria-checked="${auto}"><i></i></button>
+        </div>
+        <div style="border-top:1px solid var(--divider);margin-top:12px;padding-top:12px">
+          <label class="f">A price counts as out of date after</label>
+          <div class="seg">
+            ${[3, 6, 12, 24].map((v) => `<button data-refreshhrs="${v}" aria-pressed="${refreshHrs() === v}">${v} hr</button>`).join('')}
+          </div>
+          <div class="muted" style="font-size:10.5px;margin-top:6px">Shorter = more current numbers, more data use. ${S.staleItems().length} out of date right now.</div>
+        </div>
+      </div>
+
       <h4 style="margin:22px 0 10px">Notifications</h4>
       <div class="card">
         <div style="display:flex;align-items:center;gap:10px">
           <div style="flex:1">
-            <div style="font-size:12.5px;font-weight:700">Tell me about new messages</div>
+            <div style="font-size:12.5px;font-weight:700">New messages and watch targets hit</div>
             <div class="muted" style="font-size:10.5px">${notifBlocked()
               ? 'Blocked in your browser — allow notifications for this site, then flip this on'
               : notifOn() ? 'On for this device only — silent while you’re on the Chat tab' : 'Off — the chat tab still shows a dot'}</div>
@@ -1891,7 +2217,7 @@ window.TROVE_CONFIG = {
           ${svg(ICON.refresh, 19)}<span style="flex:1;text-align:left;font-size:13px;font-weight:600">Reset this phone to the starter catalog</span>
         </button>
       </div>
-      <p class="muted" style="font-size:10.5px;margin-top:14px">Market values are recent sold medians. Refresh an item to pull live listings and its real photo.</p>
+      <p class="muted" style="font-size:10.5px;margin-top:14px">Market values are PriceCharting sold medians by condition; asking prices are live eBay listings or a price you typed in. A green dot means the number is current.</p>
     </div>`;
   }
 
@@ -1900,10 +2226,11 @@ window.TROVE_CONFIG = {
     const it = (st().items || []).find((i) => i.id === ui.detail);
     if (!it) return '';
     const g = grade(it);
-    const n = netOf(it);
     const w = (st().watch || {})[it.id];
-    const listings = it.listings || [];
+    const listings = hasAsk(it) ? (it.listings || []) : [];
     const [plabel, pbg, pfg] = platOf(it);
+    const f = freshness(it);
+    const busy = ui.detailBusy === it.id;
     return sheet(`
       <div style="display:flex;align-items:center;gap:13px">
         ${art(it, 74, 20)}
@@ -1932,11 +2259,13 @@ window.TROVE_CONFIG = {
           <div>
             <div class="kicker">Market value</div>
             <div class="disp" style="font-size:30px">${money(mv(it))}</div>
-            <div style="font-size:10.5px;color:var(--accent-300)">${it.refreshedAt ? (it.estimated ? 'live asking median' : 'PriceCharting sold median') : 'starter number — refresh for live data'}${it.liveCount ? ' · ' + it.liveCount + ' listings' : ''}</div>
+            <div style="font-size:10.5px;color:${f.fresh ? 'var(--sage-300)' : 'var(--accent-300)'}">${busy ? 'Updating now…'
+              : it.refreshedAt ? esc((it.marketSource || 'PriceCharting') + ' · ' + f.label) : 'Starter estimate — updating'}${it.liveCount ? ' · ' + it.liveCount + ' listings' : ''}</div>
           </div>
           <div style="margin-left:auto;text-align:right">
-            <div class="kicker">Best price now</div>
-            <div class="disp" style="font-size:24px;color:var(--sage-300)">${money(it.buy)}</div>
+            <div class="kicker">Asking now</div>
+            <div class="disp" style="font-size:24px;color:var(--sage-300)">${hasAsk(it) ? money(it.buy) : '—'}</div>
+            ${hasAsk(it) ? `<div style="font-size:10px;color:var(--accent-300);margin-top:2px">${esc(askLabel(it))}</div>` : ''}
             <div class="stamp ${g.cls}" style="margin-top:6px">${esc(g.label)}</div>
           </div>
         </div>
@@ -1956,7 +2285,11 @@ window.TROVE_CONFIG = {
       </div>
 
       <h4 style="margin:20px 0 4px">Buy or pass</h4>
-      <p class="muted" style="font-size:11.5px;margin:0 0 4px">Every number below is market value with fees, shipping and your margin taken off it — no estimates.</p>
+      <p class="muted" style="font-size:11.5px;margin:0 0 8px">Looking at one right now? Type what they want for it.</p>
+      <div style="display:flex;gap:9px">
+        <input class="in" id="askBox" inputmode="decimal" placeholder="${hasAsk(it) && it.askSrc === 'you' ? 'You entered ' + money(it.buy) : 'Asking price'}" style="flex:1" autocomplete="off">
+        <button class="btn btn-primary" data-setask="${it.id}">Check</button>
+      </div>
       ${flowChart(it)}
 
       ${(() => { const p = sellPlan(it); return `<div class="cab cab-sage" style="margin-top:12px">
@@ -1965,7 +2298,7 @@ window.TROVE_CONFIG = {
           ? (p.t.pct > 4 ? 'Up ' + p.t.pct.toFixed(1) + '% across ' + p.t.n + ' readings — holding has paid'
             : p.t.pct < -4 ? 'Down ' + Math.abs(p.t.pct).toFixed(1) + '% across ' + p.t.n + ' readings — list it'
               : 'Flat across ' + p.t.n + ' readings')
-          : 'Refresh a few times and a measured trend appears here — nothing is guessed.'}</div>
+          : 'A measured trend appears here once Trove has stored a few days of readings — nothing is guessed.'}</div>
         <div style="display:flex;gap:9px;margin-top:12px;position:relative">
           <button class="btn" data-copytitle="${it.id}" style="flex:1;background:rgba(255,255,255,.16);color:var(--sage-100);border:0">Copy listing title</button>
           <a class="btn" href="https://www.ebay.com/sl/sell" target="_blank" rel="noopener" style="background:var(--sage-300);color:var(--sage-800)">List on eBay</a>
@@ -1975,11 +2308,11 @@ window.TROVE_CONFIG = {
       <h4 style="margin:22px 0 6px">Find one cheap</h4>
       ${dealsBlock(it)}
       <div style="display:flex;gap:8px;margin-top:10px">
-        <a class="btn btn-secondary" href="${D.soldCompsCond(it.name, it.region, it.cond)}" target="_blank" rel="noopener" style="flex:1;font-size:12.5px">What it sold for ${svg(ICON.out, 13)}</a>
-        <a class="btn btn-secondary" href="${it.pcUrl || D.priceCharting(it.name)}" target="_blank" rel="noopener" style="flex:1;font-size:12.5px">Price history ${svg(ICON.out, 13)}</a>
+        <a class="btn btn-secondary" href="${esc(D.soldCompsCond(it.name, it.region, it.cond))}" target="_blank" rel="noopener" style="flex:1;font-size:12.5px">What it sold for ${svg(ICON.out, 13)}</a>
+        <a class="btn btn-secondary" href="${esc(it.pcUrl || D.priceCharting(it.name))}" target="_blank" rel="noopener" style="flex:1;font-size:12.5px">Price history ${svg(ICON.out, 13)}</a>
       </div>
 
-      ${listings.length ? `<h4 style="margin:22px 0 8px">Cheapest right now ${it.estimated ? '' : ''}</h4>
+      ${listings.length ? `<h4 style="margin:22px 0 8px">Cheapest right now</h4>
       <a class="row" href="${esc(listings[0].url)}" target="_blank" rel="noopener" style="text-decoration:none;background:var(--accent-100);margin-bottom:10px">
         ${listings[0].image ? `<div class="art" style="width:58px;height:58px;background:#fff"><img src="${esc(listings[0].image)}" alt="" style="object-fit:contain;padding:3px"></div>` : art(it, 58)}
         <div style="flex:1;min-width:0">
@@ -1988,7 +2321,7 @@ window.TROVE_CONFIG = {
         </div>
         <div style="text-align:right;flex:none">
           <div class="disp" style="font-size:18px">${money(listings[0].landed || listings[0].price)}</div>
-          <div class="stamp stamp-good" style="margin-top:4px;font-size:9.5px;padding:3px 8px">${Math.round(((mv(it) - (listings[0].landed || listings[0].price)) / mv(it)) * 100)}% off</div>
+          <div class="stamp stamp-good" style="margin-top:4px;font-size:9.5px;padding:3px 8px">${mv(it) ? Math.round(((mv(it) - (listings[0].landed || listings[0].price)) / mv(it)) * 100) : 0}% off</div>
         </div>
       </a>
       <h4 style="margin:16px 0 8px">Other live listings</h4>
@@ -2001,17 +2334,17 @@ window.TROVE_CONFIG = {
           </div>
           <div style="text-align:right;flex:none">
             <div class="disp" style="font-size:16px">${money(l.landed || l.price)}</div>
-            <div style="font-size:10px;color:${(l.landed || l.price) < mv(it) ? 'var(--sage-700)' : 'var(--n-600)'}">${Math.round(((mv(it) - (l.landed || l.price)) / mv(it)) * 100)}% off market</div>
+            <div style="font-size:10px;color:${(l.landed || l.price) < mv(it) ? 'var(--sage-700)' : 'var(--n-600)'}">${mv(it) ? Math.round(((mv(it) - (l.landed || l.price)) / mv(it)) * 100) : 0}% off market</div>
           </div>
         </a>`).join('')}
       </div>` : `<div style="margin-top:20px;padding:14px 16px;border-radius:22px;border:1px dashed var(--n-400);display:flex;align-items:center;gap:11px">
-        <div style="flex:1;font-size:12px" class="muted">Refresh to pull live listings with photos and link straight to the cheapest one.</div>
+        <div style="flex:1;font-size:12px" class="muted">${busy ? 'Pulling live listings…' : 'No current live listings. Refresh to pull them with photos and a link to the cheapest.'}</div>
         <button class="btn btn-secondary" data-refresh="${it.id}" style="font-size:12.5px">${svg(ICON.refresh, 15)} Refresh</button>
       </div>`}
 
       <h4 style="margin:22px 0 8px">Where to look</h4>
       <div class="card" style="padding:4px 15px">
-        ${D.SOURCES.map((v) => `<a class="linkrow" href="${v.url(it.name)}" target="_blank" rel="noopener" style="border-top:1px solid var(--divider)">
+        ${D.SOURCES.map((v) => `<a class="linkrow" href="${esc(v.url(it.name))}" target="_blank" rel="noopener" style="border-top:1px solid var(--divider)">
           <span class="tag ${v.kind === 'retail' ? 'tag-sage' : 'tag-accent'}" style="font-size:9.5px">${v.kind}</span>
           <span style="flex:1;font-size:12.5px;font-weight:600">${esc(v.name)}</span>${svg(ICON.out, 14)}
         </a>`).join('')}
@@ -2019,11 +2352,12 @@ window.TROVE_CONFIG = {
 
       <h4 style="margin:22px 0 8px">Alert me</h4>
       <div class="card">
-        <label class="f">Tell me when it drops under</label>
+        <label class="f">Tell me when a live ask drops under</label>
         <div style="display:flex;gap:9px">
-          <input class="in" id="targetBox" inputmode="numeric" placeholder="${Math.round(mv(it) * 0.8)}" value="${w ? w.target : ''}" style="flex:1">
+          <input class="in" id="targetBox" inputmode="numeric" placeholder="${maxBuy(it)}" value="${w ? w.target : ''}" style="flex:1">
           <button class="btn btn-primary" data-watch="${it.id}">${w ? 'Update' : 'Watch'}</button>
         </div>
+        <div class="muted" style="font-size:10.5px;margin-top:6px">Blank = your pay-no-more-than number. Watched items are re-checked first.</div>
       </div>
 
       <div style="display:flex;gap:9px;margin:16px 0 4px">
@@ -2035,12 +2369,12 @@ window.TROVE_CONFIG = {
         <button class="icon-btn" data-tochat="${it.id}" aria-label="Send to chat">${svg(ICON.send, 18)}</button>
       </div>
       <div style="display:flex;align-items:center;gap:10px;margin-top:6px">
-        <p class="muted" style="font-size:10.5px;flex:1;margin:0">${it.refreshedAt ? (it.marketSource || 'Live') + ' · updated ' + new Date(it.refreshedAt).toLocaleString() : 'Starter number — tap refresh for live market data.'}</p>
+        <p class="muted" style="font-size:10.5px;flex:1;margin:0">${it.refreshedAt ? (it.marketSource || 'Live') + ' · updated ' + new Date(it.refreshedAt).toLocaleString() : 'Starter estimate — Trove is fetching the live price.'}</p>
         ${it.pcUrl ? `<a href="${esc(it.pcUrl)}" target="_blank" rel="noopener" style="font-size:10.5px;font-weight:700">Price history ${svg(ICON.out, 11)}</a>` : ''}
       </div>
       <button class="btn btn-ghost btn-block" data-remove="${it.id}" style="margin-top:14px;color:var(--accent-700)">Stop tracking this item</button>
     `, [
-      `<a class="btn btn-primary" href="${buyUrl(it)}" target="_blank" rel="noopener" style="flex:1">${esc(buyLabel(it))}</a>`,
+      `<a class="btn btn-primary" href="${esc(buyUrl(it))}" target="_blank" rel="noopener" style="flex:1">${esc(buyLabel(it))}</a>`,
       `<button class="btn btn-secondary" data-sheet="flip" data-flipitem="${it.id}">Log flip</button>`,
     ]);
   }
@@ -2059,7 +2393,7 @@ window.TROVE_CONFIG = {
 
   function addSheet() {
     return sheet(`<h4 style="margin:0 0 4px">Track something</h4>
-      <p class="muted" style="font-size:12.5px">Name it the way you'd search for it — that's what the buy links use.</p>
+      <p class="muted" style="font-size:12.5px">Name it the way you'd search for it — that's what the price lookup and buy links use.</p>
       <div style="margin-top:10px"><label class="f">Name</label><input class="in" id="addName" value="${esc(ui.q)}" placeholder="Pokemon Silver Game Boy Color"></div>
       <div style="display:flex;gap:9px;margin-top:10px">
         <div style="flex:1"><label class="f">Region</label><select class="in" id="addRegion">
@@ -2114,24 +2448,24 @@ window.TROVE_CONFIG = {
         ${(st().items || []).slice(0, 60).map((i) => `<button class="row" data-pickattach="${i.id}">
           ${art(i, 40)}
           <div style="flex:1;min-width:0"><div class="ellip" style="font-size:12.5px;font-weight:600">${esc(i.name)}</div>
-          <div class="muted" style="font-size:10px">${money(i.buy)} · market ${money(mv(i))}</div></div>
+          <div class="muted" style="font-size:10px">${priceLine(i)}</div></div>
         </button>`).join('')}
       </div>`, [`<button class="btn btn-secondary" data-close="1" style="flex:1">Cancel</button>`]);
   }
 
   function scanSheet() {
     const r = scan.result;
-    const live = !!scanStream;
+    const live2 = !!scanStream;
     const fake = r && { id: 'scan', name: (r.market && r.market.title) || r.query, kind: scan.kind || 'game', cond: scan.cond, sell: r.soldMedian || 0 };
-    const kinds = [["game","Game"],["console","Console"],["handheld","Handheld"],["accessory","Accessory"]];
-    const conds = [["loose","Loose"],["used","Used"],["cib","CIB"],["sealed","Sealed"]];
+    const kinds = [['game', 'Game'], ['console', 'Console'], ['handheld', 'Handheld'], ['accessory', 'Accessory']];
+    const conds = [['loose', 'Loose'], ['used', 'Used'], ['cib', 'CIB'], ['sealed', 'Sealed']];
 
     return sheet(`<h4 style="margin:0 0 4px">Scan a barcode</h4>
       <p class="muted" style="font-size:12.5px">Hold the barcode in the frame. It grabs whatever it sees — then you say what it is, and Trove prices it.</p>
 
       <div id="scanView" style="position:relative;margin-top:12px;aspect-ratio:4/3;border-radius:24px;overflow:hidden;
         background:linear-gradient(155deg,#402310,#2b1a11);display:grid;place-items:center">
-        ${live ? `<div style="position:absolute;inset:0;pointer-events:none">
+        ${live2 ? `<div style="position:absolute;inset:0;pointer-events:none">
             <div style="position:absolute;inset:22% 8%;border-radius:14px;box-shadow:0 0 0 2000px rgba(20,12,8,.40);border:2px solid rgba(255,198,165,.55)"></div>
             <div style="position:absolute;left:8%;right:8%;top:50%;height:2px;background:var(--accent-300)"></div>
           </div>`
@@ -2141,7 +2475,7 @@ window.TROVE_CONFIG = {
           </div>`}
       </div>
 
-      ${live ? `<div style="display:flex;align-items:center;gap:9px;margin-top:9px">
+      ${live2 ? `<div style="display:flex;align-items:center;gap:9px;margin-top:9px">
           <span class="kicker" id="scanStat" style="flex:1">${esc(scanStatText())}</span>
           <button class="btn btn-ghost" data-scanstop="1" style="font-size:11.5px">Stop camera</button>
         </div>` : ''}
@@ -2194,7 +2528,7 @@ window.TROVE_CONFIG = {
       </div>
       <div style="display:flex;gap:8px;margin-top:10px">
         <button class="btn btn-sage" data-scantrack="1" style="flex:1">Track this</button>
-        <button class="btn btn-secondary" data-scanhaul="1">Add to haul</button>
+        <button class="btn btn-secondary" data-scanhaul="1">Add to pile</button>
         <button class="btn btn-secondary" data-scannext="1">Next</button>
       </div>` : ''}
 
@@ -2214,7 +2548,7 @@ window.TROVE_CONFIG = {
             <div class="ellip" style="font-size:12.5px;font-weight:700">${esc(h.name)}</div>
             <div class="muted" style="font-size:10.5px;margin-top:2px">${money(h.market)} · ${esc(condLabel(h.cond))} · ${esc(h.code)}</div>
           </div>
-          <button class="btn btn-ghost" data-scanloghaul="${i}" style="font-size:11.5px;flex:none">+ Haul</button>
+          <button class="btn btn-ghost" data-scanloghaul="${i}" style="font-size:11.5px;flex:none">+ Pile</button>
         </div>`).join('')}
       </div>`
       : `<div style="text-align:center;padding:22px 16px;border:1px dashed var(--n-400);border-radius:22px">
@@ -2263,8 +2597,8 @@ window.TROVE_CONFIG = {
     return sheet(`<h4 style="margin:0 0 4px">Price the whole pile</h4>
       <p class="muted" style="font-size:12.5px">Box lot, table, estate sale bin — add everything, and Trove totals what it's worth and the most the lot is worth paying.</p>
       <div style="display:flex;gap:9px;margin-top:10px">
-        <input class="in" id="haulBox" placeholder="Add — e.g. Chrono Trigger SNES" style="flex:1" autocomplete="off">
-        <button class="btn btn-primary" data-hauladd="1">Add</button>
+        <input class="in" id="haulBox" placeholder="Add — e.g. Chrono Trigger SNES" style="flex:1" autocomplete="off" enterkeyhint="done">
+        <button class="btn btn-primary" data-hauladd="1">${ui.haulBusy ? '…' : 'Add'}</button>
       </div>
       <div style="display:flex;gap:9px;margin-top:9px">
         <select class="in" id="haulKind" style="flex:1">
@@ -2293,27 +2627,56 @@ window.TROVE_CONFIG = {
         : [`<button class="btn btn-secondary" data-close="1" style="flex:1">Done</button>`]);
   }
 
+  // Quick price: results update as you type, and stale replies are thrown away.
+  let quickSeq = 0, quickT = null, quickAskT = null;
+  async function runQuick(explicit) {
+    const box = $('quickBox');
+    const q = ((box && box.value) || ui.quickQ || '').trim();
+    if (!q) { if (explicit) toast('Type what you are looking at'); return; }
+    if (ui.quick && ui.quick.query !== q) ui.quickAsk = 0;
+    ui.quickQ = q;
+    const val = (id, d) => { const el = $(id); return el ? el.value : d; };
+    ui.quickCond = val('quickCond', ui.quickCond || 'used');
+    ui.quickRegion = val('quickRegion', ui.quickRegion || 'en');
+    ui.quickKind = val('quickKind', ui.quickKind || 'game');
+    ui.quickPlat = val('quickPlat', ui.quickPlat || '');
+    const seq = ++quickSeq;
+    ui.quickBusy = true; render();
+    try {
+      const r = await S.quickLook(q, ui.quickCond, ui.quickRegion, ui.quickKind, ui.quickPlat || null);
+      if (seq !== quickSeq) return;
+      ui.quick = r;
+    } catch (err) {
+      if (seq !== quickSeq) return;
+      ui.quick = null;
+      toast(err.message);
+    }
+    ui.quickBusy = false;
+    render();
+  }
+
   function quickSheet() {
     const r = ui.quick;
+    const sel = (v, cur) => (v === cur ? 'selected' : '');
     return sheet(`<h4 style="margin:0 0 4px">Price anything</h4>
-      <p class="muted" style="font-size:12.5px">Standing in a thrift store? Type what's in your hand and get the market number before you buy it.</p>
+      <p class="muted" style="font-size:12.5px">Standing in a thrift store? Type what's in your hand — the market number appears as you type.</p>
       <div style="display:flex;gap:9px;margin-top:10px">
-        <input class="in" id="quickBox" placeholder="Pokemon Silver Game Boy Color" value="${esc(ui.quickQ || '')}" style="flex:1">
-        <button class="btn btn-primary" data-lookup="1">Check</button>
+        <input class="in" id="quickBox" placeholder="Pokemon Silver Game Boy Color" value="${esc(ui.quickQ || '')}" style="flex:1" autocomplete="off" enterkeyhint="search">
+        <button class="btn btn-primary" data-lookup="1">${ui.quickBusy ? 'Checking…' : 'Check'}</button>
       </div>
       <div style="display:flex;gap:9px;margin-top:9px">
         <select class="in" id="quickKind" style="flex:1">
-          <option value="game">Game</option><option value="console">Console</option>
-          <option value="handheld">Handheld</option><option value="accessory">Accessory</option>
+          <option value="game" ${sel('game', ui.quickKind || 'game')}>Game</option><option value="console" ${sel('console', ui.quickKind)}>Console</option>
+          <option value="handheld" ${sel('handheld', ui.quickKind)}>Handheld</option><option value="accessory" ${sel('accessory', ui.quickKind)}>Accessory</option>
         </select>
         <select class="in" id="quickCond" style="flex:1">
-          <option value="loose">Loose / cart only</option><option value="used" selected>Used</option>
-          <option value="cib">Complete in box</option><option value="sealed">Sealed</option>
+          <option value="loose" ${sel('loose', ui.quickCond)}>Loose / cart only</option><option value="used" ${sel('used', ui.quickCond || 'used')}>Used</option>
+          <option value="cib" ${sel('cib', ui.quickCond)}>Complete in box</option><option value="sealed" ${sel('sealed', ui.quickCond)}>Sealed</option>
         </select>
         <select class="in" id="quickRegion" style="flex:1">
-          <option value="en" ${(ui.quickRegion || 'en') === 'en' ? 'selected' : ''}>US / English</option>
-          <option value="jp" ${ui.quickRegion === 'jp' ? 'selected' : ''}>Japanese</option>
-          <option value="pal" ${ui.quickRegion === 'pal' ? 'selected' : ''}>PAL / EU</option>
+          <option value="en" ${sel('en', ui.quickRegion || 'en')}>US / English</option>
+          <option value="jp" ${sel('jp', ui.quickRegion)}>Japanese</option>
+          <option value="pal" ${sel('pal', ui.quickRegion)}>PAL / EU</option>
         </select>
       </div>
       <div style="margin-top:9px">
@@ -2325,9 +2688,12 @@ window.TROVE_CONFIG = {
       </div>
       <p class="muted" style="font-size:10.5px;margin:7px 2px 0">Naming the console is what keeps a US N64 search from coming back with the Japanese release.</p>
       ${r ? (() => {
+        const typed = ui.quickAsk || 0;
+        const ask = typed || Math.round(r.lowestBuy || 0);
         const subj = { id: 'quick', name: (r.market && r.market.title) || r.query, kind: ui.quickKind || 'game',
           cond: ui.quickCond || 'used', region: ui.quickRegion || 'en', sell: r.soldMedian || 0,
-          tiers: r.tiers || null, buy: Math.round(r.lowestBuy || 0), pcMatch: r.market ? r.market.title + (r.market.console ? ' · ' + r.market.console : '') : null };
+          tiers: r.tiers || null, buy: ask, askAt: ask ? Date.now() : 0, askSrc: typed ? 'you' : 'ebay',
+          pcMatch: r.market ? r.market.title + (r.market.console ? ' · ' + r.market.console : '') : null };
         const mx = maxBuy(subj);
         const note = r.note || {};
         const warn = note.platformMiss
@@ -2361,6 +2727,8 @@ window.TROVE_CONFIG = {
         </div>
       </div>
       <h4 style="margin:18px 0 6px">Buy or pass</h4>
+      <label class="f">What are they asking?${r.lowestBuy && !typed ? ' <span class="muted">(showing cheapest online)</span>' : ''}</label>
+      <input class="in" id="quickAsk" inputmode="decimal" placeholder="${r.lowestBuy ? 'Online from ' + money(r.lowestBuy) : 'e.g. 25'}" value="${typed || ''}" autocomplete="off">
       ${flowChart(subj)}
       <h4 style="margin:18px 0 6px">Find one cheap</h4>
       ${dealsBlock(subj)}
@@ -2373,11 +2741,14 @@ window.TROVE_CONFIG = {
       </div>` : ''}
       <div style="display:flex;gap:8px;margin-top:12px">
         <button class="btn btn-sage" data-quickadd="1" style="flex:1">Track this</button>
-        <a class="btn btn-secondary" href="${D.soldCompsCond(subj.name, subj.region, subj.cond)}" target="_blank" rel="noopener">Sold for</a>
+        <a class="btn btn-secondary" href="${esc(D.soldCompsCond(subj.name, subj.region, subj.cond))}" target="_blank" rel="noopener">Sold for</a>
       </div>`; })()
+      : ui.quickBusy ? `<div class="card" style="margin-top:14px;display:flex;align-items:center;gap:10px">
+          <span class="spin" style="color:var(--accent);display:grid;place-items:center">${svg(ICON.refresh, 16)}</span>
+          <span style="font-size:12.5px;font-weight:600">Checking the live market…</span></div>`
       : `<div style="margin-top:14px;display:flex;gap:8px">
-          <a class="btn btn-secondary" href="${D.soldComps(ui.quickQ || 'retro game', ui.quickRegion)}" target="_blank" rel="noopener" style="flex:1;font-size:12.5px">Sold comps ${svg(ICON.out, 13)}</a>
-          <a class="btn btn-secondary" href="${D.priceCharting(ui.quickQ || 'retro game')}" target="_blank" rel="noopener" style="flex:1;font-size:12.5px">PriceCharting ${svg(ICON.out, 13)}</a>
+          <a class="btn btn-secondary" href="${esc(D.soldComps(ui.quickQ || 'retro game', ui.quickRegion))}" target="_blank" rel="noopener" style="flex:1;font-size:12.5px">Sold comps ${svg(ICON.out, 13)}</a>
+          <a class="btn btn-secondary" href="${esc(D.priceCharting(ui.quickQ || 'retro game'))}" target="_blank" rel="noopener" style="flex:1;font-size:12.5px">PriceCharting ${svg(ICON.out, 13)}</a>
         </div>`}`,
       [`<button class="btn btn-secondary" data-close="1" style="flex:1">Done</button>`]);
   }
@@ -2431,7 +2802,6 @@ window.TROVE_CONFIG = {
     document.querySelectorAll(FIELDS).forEach((el) => {
       if (el.type === 'file') return;
       const before = painted[el.id];
-      // Only put the typed value back when the repaint didn't deliberately change it.
       if (snap.edited[el.id] !== undefined && (before === undefined || before === el.value)) el.value = snap.edited[el.id];
       next[el.id] = el.value;
     });
@@ -2449,7 +2819,13 @@ window.TROVE_CONFIG = {
   };
   // Sync, photos and price refreshes wait for a pause instead of yanking the screen.
   function renderBg() {
-    if (isTyping()) { clearTimeout(bgT); bgT = setTimeout(renderBg, 700); return; }
+    if (isTyping()) {
+      clearTimeout(bgT);
+      bgT = setTimeout(renderBg, 700);
+      // The rows and the refresh bar can still update safely under the cursor.
+      if (ui.tab === 'browse' && !ui.sheet && !ui.detail) { paintRefreshBar(); }
+      return;
+    }
     render();
   }
 
@@ -2497,15 +2873,15 @@ window.TROVE_CONFIG = {
 
   function paint() {
     const s = st();
-    const titles = { browse: 'Search', steals: 'Steals', watch: 'Watchlist', chat: 'Chat', ledger: 'Ledger', you: 'You' };
+    const titles = { browse: 'Check', steals: 'Steals', watch: 'Watchlist', chat: 'Chat', ledger: 'Ledger', you: 'You' };
     $('top').innerHTML = `<div style="margin-right:auto">
         <div class="brand"><i>${svg(ICON.zap, 15)}</i>Trove</div>
-        <div class="kicker" style="margin-top:5px">${esc(titles[ui.tab] || '')} · market value &amp; steals</div>
+        <div class="kicker" style="margin-top:5px">${esc(titles[ui.tab] || '')} · know it before you buy it</div>
       </div>
-      ${ui.tab !== 'browse' ? `<button class="icon-btn" data-tab="browse" aria-label="Search">${svg(ICON.search, 19)}</button>` : ''}`;
+      ${ui.tab !== 'browse' ? `<button class="icon-btn" data-tab="browse" aria-label="Check a price">${svg(ICON.search, 19)}</button>` : ''}`;
 
     const unread = (s.messages || []).some((m) => m.by !== meName() && m.t > lastSeen());
-    const tabs = [['browse', 'Search', ICON.search], ['steals', 'Steals', ICON.zap], ['watch', 'Watch', ICON.mark],
+    const tabs = [['browse', 'Check', ICON.search], ['steals', 'Steals', ICON.zap], ['watch', 'Watch', ICON.mark],
       ['chat', 'Chat', ICON.chat], ['you', 'You', ICON.user]];
     $('tabs').innerHTML = tabs.map(([k, l, i]) =>
       `<button data-tab="${k}" ${ui.tab === k || (k === 'you' && ui.tab === 'ledger') ? 'aria-current="page"' : ''} style="position:relative">
@@ -2531,7 +2907,7 @@ window.TROVE_CONFIG = {
           : ui.sheet === 'attach' ? attachSheet()
             : ui.sheet === 'signin' ? signinSheet() : '');
 
-    if (ui.tab === 'browse' && ui.qFocus && document.activeElement !== $('searchBox')) {
+    if (ui.tab === 'browse' && ui.qFocus && !ui.sheet && !ui.detail && document.activeElement !== $('searchBox')) {
       const b = $('searchBox');
       if (b) { b.focus({ preventScroll: true }); b.setSelectionRange(b.value.length, b.value.length); }
     }
@@ -2589,9 +2965,26 @@ window.TROVE_CONFIG = {
     reader.readAsDataURL(file);
   }
 
+  // Open an item and, if its price is out of date, bring it current right away.
+  function openItem(id) {
+    setUI({ detail: id, sheet: null });
+    const it = st().items.find((i) => i.id === id);
+    if (!it || freshness(it).fresh || ui.detailBusy) return;
+    ui.detailBusy = id;
+    S.refreshPrice(it).catch(() => {}).finally(() => { ui.detailBusy = null; renderBg(); });
+  }
+
   // ---------- events ----------
+  const ACTIONS = ['tab', 'open', 'close', 'backdrop', 'sheet', 'sort', 'kind', 'plat', 'era', 'clearq', 'watch', 'unwatch',
+    'refresh', 'add', 'logflip', 'delflip', 'togglefees', 'togglenotif', 'signout', 'sendlink', 'verify', 'join', 'repair',
+    'reset', 'send', 'unattach', 'pickattach', 'clearphoto', 'tochat', 'refreshall', 'lookup', 'quickadd', 'copytitle',
+    'arturl', 'remove', 'region', 'margin', 'hauladd', 'haulrm', 'haulclear', 'haultrack', 'scanstart', 'scanstop',
+    'scankind', 'scancond', 'scanprice', 'scanclear', 'scanmanual', 'scannext', 'scantrack', 'scanhaul', 'scanloghaul',
+    'scanlogclear', 'join2', 'setask', 'livecheck', 'livetrack', 'dismissintro', 'toggleauto', 'refreshhrs'];
+  const ACTION_SEL = ACTIONS.map((a) => '[data-' + a + ']').join(',');
+
   document.addEventListener('click', async (e) => {
-    const el = e.target.closest('[data-tab],[data-open],[data-close],[data-backdrop],[data-sheet],[data-sort],[data-kind],[data-plat],[data-era],[data-clearq],[data-watch],[data-unwatch],[data-refresh],[data-add],[data-logflip],[data-delflip],[data-togglefees],[data-togglenotif],[data-signout],[data-sendlink],[data-verify],[data-join],[data-repair],[data-reset],[data-send],[data-unattach],[data-pickattach],[data-clearphoto],[data-tochat],[data-refreshall],[data-lookup],[data-quickadd],[data-copytitle],[data-arturl],[data-remove],[data-region],[data-margin],[data-hauladd],[data-haulrm],[data-haulclear],[data-haultrack],[data-scanstart],[data-scanstop],[data-scankind],[data-scancond],[data-scanprice],[data-scanclear],[data-scanmanual],[data-scannext],[data-scantrack],[data-scanhaul],[data-scanloghaul],[data-scanlogclear],[data-join2]');
+    const el = e.target.closest(ACTION_SEL);
     if (!el) return;
     const d = el.dataset;
     if (el.tagName === 'A') return;
@@ -2600,25 +2993,60 @@ window.TROVE_CONFIG = {
     if (d.backdrop || d.close) { if (scanStream) stopScan(); return setUI({ sheet: null, detail: null }); }
 
     if (d.tab) {
-      setUI({ tab: d.tab, detail: null, sheet: null });
-      if (d.tab === 'chat') markSeen();   // setUI already pinned the log to the newest message
+      setUI({ tab: d.tab, detail: null, sheet: null, qFocus: false });
+      if (d.tab === 'chat') markSeen();
       return;
     }
-    if (d.open) return setUI({ detail: d.open, sheet: null });
+    if (d.open) return openItem(d.open);
     if (d.sheet) return setUI({ sheet: d.sheet, detail: null, flipItem: d.flipitem || ui.detail || null });
 
+    if (d.dismissintro) { localStorage.setItem(INTRO_KEY, '1'); return render(); }
+
     if (d.sort) return setUI({ sort: d.sort });
-    if (d.kind) return setUI({ kind: d.kind });
-    if (d.plat) return setUI({ plat: d.plat });
+    if (d.kind) { setUI({ kind: d.kind }); return scheduleLive(); }
+    if (d.plat) { setUI({ plat: d.plat }); return scheduleLive(); }
     if (d.era) return setUI({ era: d.era });
-    if (d.region) return setUI({ region: d.region });
+    if (d.region) { setUI({ region: d.region }); return scheduleLive(); }
     if (d.margin) { S.update((s) => { s.settings.targetMargin = parseInt(d.margin, 10); }); return; }
-    if (d.clearq) { ui.q = ''; return setUI({ qFocus: true }); }
+    if (d.refreshhrs) { S.update((s) => { s.settings.refreshHours = parseInt(d.refreshhrs, 10); }); return; }
+    if (d.toggleauto) {
+      S.update((s) => { const on = s.settings.autoRefresh !== false; s.settings.autoRefresh = !on; });
+      if (st().settings.autoRefresh) { lastAuto = 0; autoRefresh(); }
+      return;
+    }
+    if (d.clearq) { ui.q = ''; scheduleLive(); return setUI({ qFocus: true }); }
+
+    if (d.livecheck) {
+      const a = liveArgs();
+      Object.assign(ui, { quickQ: live.q, quickKind: a.kind || 'game', quickRegion: a.region, quickPlat: a.platform || '',
+        quickCond: 'used', quick: null, quickAsk: 0, qFocus: false });
+      setUI({ sheet: 'quick', detail: null });
+      return runQuick(false);
+    }
+    if (d.livetrack && live.r && live.r.row) {
+      const a = liveArgs(), r = live.r.row;
+      const id = trackResult({ query: live.q, market: r, soldMedian: tierFor(r, 'used'),
+        tiers: { loose: r.loose, cib: r.cib, sealed: r.sealed }, image: r.image, pcUrl: r.url,
+        stale: live.r.stale, cachedAt: live.r.cachedAt }, a.kind || 'game', 'used', a.region, a.platform);
+      toast('Tracking it — fetching live asks');
+      ui.qFocus = false;
+      return openItem(id);
+    }
+
+    if (d.setask) {
+      const raw = (($('askBox') || {}).value || '').replace(/[^0-9.]/g, '');
+      const v = parseFloat(raw);
+      if (!v) return toast('Type the price they want');
+      S.update((s) => { const it = s.items.find((i) => i.id === d.setask); if (it) { it.buy = Math.round(v); it.askAt = Date.now(); it.askSrc = 'you'; } });
+      const box = $('askBox'); if (box) box.value = '';
+      painted.askBox = '';
+      return;
+    }
 
     if (d.watch) {
       const box = $('targetBox');
       const it = st().items.find((i) => i.id === d.watch);
-      const target = parseFloat((box && box.value) || '') || Math.round(mv(it) * 0.8);
+      const target = parseFloat((box && box.value) || '') || maxBuy(it);
       S.update((s) => { s.watch[d.watch] = { target, by: meName() }; });
       toast('Watching under ' + money(target));
       return;
@@ -2627,42 +3055,18 @@ window.TROVE_CONFIG = {
 
     if (d.refresh) {
       const it = st().items.find((i) => i.id === d.refresh);
-      toast('Checking live prices…');
-      try { await S.refreshPrice(it); toast('Prices updated'); }
+      ui.detailBusy = it.id; render();
+      try { await S.refreshPrice(it, { fresh: true }); toast('Prices updated'); }
       catch (err) { toast(err.message); }
+      ui.detailBusy = null; render();
       return;
     }
 
     if (d.refreshall) {
-      if (ui.refresh) return;
-      ui.refresh = { done: 0, total: 0 };
-      paintRefreshBar();
-      try {
-        const n = await S.refreshStale(true, (done, total) => {
-          ui.refresh = { done, total };
-          paintRefreshBar();
-        });
-        ui.refresh = null;
-        render();
-        toast(n ? 'Updated ' + n + ' prices' : 'Nothing to update');
-      } catch (err) { ui.refresh = null; render(); toast(err.message); }
-      return;
+      const stale = S.staleItems().length;
+      return runRefresh(stale ? {} : { all: true });
     }
-    if (d.lookup) {
-      const q = ($('quickBox').value || '').trim();
-      if (!q) return toast('Type what you are looking at');
-      ui.quickQ = q; toast('Checking the market…');
-      try {
-        ui.quickCond = ($('quickCond') || {}).value || 'used';
-        ui.quickRegion = ($('quickRegion') || {}).value || 'en';
-        ui.quickKind = ($('quickKind') || {}).value || 'game';
-        ui.quickPlat = ($('quickPlat') || {}).value || '';
-        ui.quick = await S.quickLook(q, ui.quickCond, ui.quickRegion, ui.quickKind, ui.quickPlat || null);
-        render();
-      }
-      catch (err) { ui.quick = null; render(); toast(err.message); }
-      return;
-    }
+    if (d.lookup) return runQuick(true);
     if (d.scanstart) { scan.err = null; return startScan(); }
     if (d.scanstop) { stopScan(); return render(); }
     if (d.scankind) { scan.kind = d.scankind; return render(); }
@@ -2683,7 +3087,7 @@ window.TROVE_CONFIG = {
       return;
     }
     if (d.scantrack && scan.result) {
-      const id = trackResult(scan.result, scan.kind || 'game', scan.cond, 'en');
+      const id = trackResult(scan.result, scan.kind || 'game', scan.cond, 'en', null);
       stopScan();
       toast('Tracking it');
       return setUI({ sheet: null, detail: id });
@@ -2694,7 +3098,7 @@ window.TROVE_CONFIG = {
         max: maxBuy({ id: name, kind: scan.kind || 'game', cond: scan.cond, sell: market }), ask: 0 });
       saveHaul();
       scan.code = null; scan.result = null;
-      toast(name + ' added to the haul — ' + money(market));
+      toast(name + ' added to the pile — ' + money(market));
       return render();
     }
     if (d.scanlogclear) { scan.log = []; saveScans(); return render(); }
@@ -2704,17 +3108,19 @@ window.TROVE_CONFIG = {
       haul.push({ name: h.name, market: h.market, kind: h.kind, cond: h.cond, region: 'en', image: h.image,
         max: maxBuy({ id: h.name, kind: h.kind, cond: h.cond, sell: h.market }), ask: 0 });
       saveHaul();
-      return toast(h.name + ' added to the haul');
+      return toast(h.name + ' added to the pile');
     }
     if (d.hauladd) {
+      if (ui.haulBusy) return;
       const q = (($('haulBox') || {}).value || '').trim();
       if (!q) return toast('What are you holding?');
       const kind = ($('haulKind') || {}).value || 'game';
       const cond = ($('haulCond') || {}).value || 'used';
       const region = ($('haulRegion') || {}).value || 'en';
-      toast('Checking ' + q + '…');
+      ui.haulBusy = true; render();
       try {
-        const r = await S.quickLook(q, cond, region, kind);
+        // Market value is all a pile needs — skip the slower eBay leg.
+        const r = await S.quickLook(q, cond, region, kind, null, { marketOnly: true });
         const name = (r.market && r.market.title) || q;
         const market = Math.round(r.soldMedian || 0);
         haul.push({ name, market, kind, cond, region, image: r.image || null,
@@ -2722,49 +3128,43 @@ window.TROVE_CONFIG = {
         saveHaul();
         const box = $('haulBox'); if (box) box.value = '';
         painted.haulBox = '';
-        render();
         toast(name + ' · ' + money(market));
       } catch (err) { toast(err.message); }
+      ui.haulBusy = false; render();
       return;
     }
     if (d.haulrm) { haul.splice(parseInt(d.haulrm, 10), 1); saveHaul(); return render(); }
     if (d.haulclear) { haul = []; saveHaul(); return render(); }
     if (d.haultrack) {
       const pile = haul.slice();
+      const now = Date.now();
       S.update((s) => {
         pile.forEach((h) => {
           s.items.unshift({ id: uid(), name: h.name, kind: h.kind, platform: 'multi', era: 'retro',
-            cond: h.cond, region: h.region, buy: h.ask || h.max, sell: h.market,
-            autoImage: h.image || null, marketSource: 'PriceCharting', refreshedAt: Date.now(),
-            history: [{ t: Date.now(), buy: h.ask || h.max, sell: h.market }] });
+            cond: h.cond, region: h.region, buy: h.ask || 0, askAt: h.ask ? now : 0, askSrc: h.ask ? 'you' : null, sell: h.market,
+            autoImage: h.image || null, marketSource: 'PriceCharting', refreshedAt: now,
+            history: h.market ? [{ t: now, buy: h.ask || 0, sell: h.market }] : [] });
         });
       });
       haul = []; saveHaul();
-      toast('Tracking ' + pile.length + ' from the haul');
+      toast('Tracking ' + pile.length + ' from the pile');
       return setUI({ sheet: null, tab: 'browse' });
     }
     if (d.quickadd && ui.quick) {
-      const r = ui.quick, id = uid();
-      const sell = Math.round(r.soldMedian || 0);
-      S.update((s) => {
-        s.items.unshift({ id, name: (r.market && r.market.title) || r.query, kind: ui.quickKind || 'game', platform: ui.quickPlat || 'multi',
-          era: 'retro', cond: ui.quickCond || 'used', region: ui.quickRegion || 'en',
-          buy: Math.round(r.lowestBuy || 0), sell, tiers: r.tiers || null,
-          autoImage: r.image || null, pcUrl: r.pcUrl || null, marketSource: 'PriceCharting',
-          listings: r.listings || [], bestUrl: (r.listings || [])[0] && r.listings[0].url,
-          refreshedAt: Date.now(), history: [{ t: Date.now(), buy: r.lowestBuy || 0, sell }] });
-      });
-      const it = st().items.find((i) => i.id === id);
-      if (!it.buy) S.update((s) => { const x = s.items.find((i) => i.id === id); if (x) x.buy = maxBuy(x); });
+      const r = ui.quick;
+      const id = trackResult(r, ui.quickKind || 'game', ui.quickCond || 'used', ui.quickRegion || 'en', ui.quickPlat || null);
+      if (ui.quickAsk) {
+        S.update((s) => { const x = s.items.find((i) => i.id === id); if (x) { x.buy = Math.round(ui.quickAsk); x.askAt = Date.now(); x.askSrc = 'you'; } });
+      }
       toast('Tracking it');
-      return setUI({ sheet: null, quick: null, detail: id });
+      return setUI({ sheet: null, quick: null, quickAsk: 0, detail: id });
     }
     if (d.copytitle) {
       const it = st().items.find((i) => i.id === d.copytitle);
       const p = sellPlan(it);
       const title = it.name + ' — ' + condLabel(it.cond) + ' — tested, fast ship';
       try { await navigator.clipboard.writeText(title); toast('Title copied · list at ' + money(p.list)); }
-      catch (e) { toast(title); }
+      catch (e2) { toast(title); }
       return;
     }
     if (d.arturl) {
@@ -2786,18 +3186,19 @@ window.TROVE_CONFIG = {
         s.items.unshift({
           id, name, kind: $('addKind').value, platform: $('addPlat').value,
           era: $('addEra').value, cond: $('addCond').value, region: $('addRegion').value,
-          buy, sell: 0, history: [],
+          buy, askAt: buy ? Date.now() : 0, askSrc: buy ? 'you' : null, sell: 0, history: [],
         });
       });
-      setUI({ sheet: null, q: '' });
+      setUI({ sheet: null, q: '', qFocus: false });
+      scheduleLive();
       toast('Looking up ' + name + '…');
+      ui.detailBusy = id;
+      setUI({ detail: id });
       try {
         await S.refreshPrice(st().items.find((i) => i.id === id));
-        const it = st().items.find((i) => i.id === id);
-        if (!it.buy) S.update((s) => { const x = s.items.find((i) => i.id === id); if (x) x.buy = maxBuy(x); });
         toast('Market value ' + money(mv(st().items.find((i) => i.id === id))));
-        setUI({ detail: id });
-      } catch (err) { toast('Added, but no market data: ' + err.message); }
+      } catch (err) { toast('Added, but no market data yet: ' + err.message); }
+      ui.detailBusy = null; render();
       return;
     }
     if (d.remove) {
@@ -2830,7 +3231,6 @@ window.TROVE_CONFIG = {
       const box = $('msgBox');
       const text = ((box && box.value) || '').trim();
       if (!text && !ui.attachItem) return;
-      // Clear the field before anything repaints, so the sent text can never come back.
       if (box) box.value = '';
       painted.msgBox = '';
       const attach = ui.attachItem;
@@ -2879,7 +3279,8 @@ window.TROVE_CONFIG = {
     if (d.repair) { S.repair(); return toast('Data repaired'); }
     if (d.reset) {
       if (!confirm('Reset this phone back to the starter catalog?')) return;
-      S.reset(); return toast('Starter catalog restored');
+      S.reset(); lastAuto = 0; setTimeout(autoRefresh, 500);
+      return toast('Starter catalog restored — fetching live prices');
     }
   });
 
@@ -2893,7 +3294,7 @@ window.TROVE_CONFIG = {
       haul[i].ask = parseFloat(e.target.value) || 0;
       saveHaul();
       clearTimeout(haulT);
-      haulT = setTimeout(() => {                      // totals only — the rows keep their carets
+      haulT = setTimeout(() => {
         const box = $('haulTotals');
         if (box) box.innerHTML = haulTotalsHtml();
       }, 160);
@@ -2902,12 +3303,24 @@ window.TROVE_CONFIG = {
     if (e.target.id === 'searchBox') {
       ui.q = e.target.value; ui.qFocus = true;
       clearTimeout(qT); qT = setTimeout(paintResults, 130);
+      scheduleLive();
+      return;
+    }
+    if (e.target.id === 'quickBox') {
+      ui.quickQ = e.target.value;
+      clearTimeout(quickT);
+      if (e.target.value.trim().length >= 3) quickT = setTimeout(() => runQuick(false), 700);
+      return;
+    }
+    if (e.target.id === 'quickAsk') {
+      ui.quickAsk = parseFloat(String(e.target.value).replace(/[^0-9.]/g, '')) || 0;
+      clearTimeout(quickAskT);
+      quickAskT = setTimeout(render, 350);
       return;
     }
     if (e.target.id === 'msgBox') { ui.draft = e.target.value; return; }
   });
 
-  // Tapping your own name should let you type over it, not force a backspace marathon.
   document.addEventListener('focusin', (e) => {
     if (e.target && (e.target.id === 'meName' || e.target.id === 'houseName')) {
       setTimeout(() => { try { e.target.select(); } catch (err) {} }, 0);
@@ -2915,7 +3328,7 @@ window.TROVE_CONFIG = {
   });
 
   document.addEventListener('change', (e) => {
-    if (e.target.id === 'meName') { setMe(e.target.value.trim() || 'Me'); return; }   // saved on blur, not per keystroke
+    if (e.target.id === 'meName') { setMe(e.target.value.trim() || 'Me'); return; }
     const photoId = e.target.dataset.photo;
     if (photoId && e.target.files && e.target.files[0]) {
       readPhoto(e.target.files[0], (dataUrl) => {
@@ -2925,42 +3338,41 @@ window.TROVE_CONFIG = {
       return;
     }
     if (e.target.id === 'venue') { S.update((s) => { s.settings.venue = e.target.value; }); }
-    if (e.target.id === 'quickCond') { ui.quickCond = e.target.value; }
-    if (e.target.id === 'quickKind') { ui.quickKind = e.target.value; }
-    if (e.target.id === 'quickRegion') { ui.quickRegion = e.target.value; }
-    if (e.target.id === 'quickPlat') { ui.quickPlat = e.target.value; }
+    if (/^quick(Cond|Kind|Region|Plat)$/.test(e.target.id)) {
+      ui[e.target.id] = e.target.value;
+      if ((ui.quickQ || '').trim()) runQuick(false);
+    }
   });
 
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && (ui.sheet || ui.detail)) setUI({ sheet: null, detail: null });
-    if (e.key === 'Enter' && e.target.id === 'scanManual') {
-      e.preventDefault();
-      const btn = document.querySelector('[data-scanmanual]');
-      if (btn) btn.click();
-      return;
-    }
-    if (e.key === 'Enter' && (e.target.id === 'haulBox' || e.target.id === 'quickBox')) {
-      e.preventDefault();
-      const btn = document.querySelector(e.target.id === 'haulBox' ? '[data-hauladd]' : '[data-lookup]');
-      if (btn) btn.click();
-      return;
-    }
-    if (e.key === 'Enter' && e.target.id === 'msgBox') {
-      e.preventDefault();
-      const btn = document.querySelector('[data-send]');
-      if (btn) btn.click();
-    }
+    if (e.key !== 'Enter') return;
+    const map = { scanManual: '[data-scanmanual]', haulBox: '[data-hauladd]', quickBox: '[data-lookup]',
+      msgBox: '[data-send]', askBox: '[data-setask]', targetBox: '[data-watch]' };
+    if (e.target.id === 'searchBox') { e.preventDefault(); clearTimeout(liveT); runLive(); e.target.blur(); return; }
+    const sel = map[e.target.id];
+    if (!sel) return;
+    e.preventDefault();
+    const btn = document.querySelector(sel);
+    if (btn) btn.click();
   });
 
-  document.addEventListener('visibilitychange', () => { if (document.hidden && scanStream) { stopScan(); render(); } });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { if (scanStream) { stopScan(); render(); } return; }
+    autoRefresh();
+  });
+  window.addEventListener('online', () => { lastAuto = 0; autoRefresh(); });
   window.addEventListener('pagehide', () => stopScan());
 
   S.on(renderBg);
   S.on(notifyNew);
+  S.on(checkTargets);
   render();
 
-  // Photos are fetched once and kept on the item; prices only refresh when asked.
+  // Photos are fetched once and kept on the item. Prices are kept fresh on their own.
   S.autoArt().catch(() => {});
+  setTimeout(autoRefresh, 2000);
+  setInterval(autoRefresh, 15 * 60e3);
 })();
 
 </script>
